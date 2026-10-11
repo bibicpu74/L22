@@ -2019,35 +2019,225 @@ jobs:
           echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
 
           mark_stage verify-rbe-graph
-          echo "=== VERIFY REWRAPPER IS PRESENT IN GENERATED GRAPH ==="
-          : > /tmp/rbe-test/rewrapper-ninja-matches.txt
-          FOUND_REWRAPPER=0
-
-          for ninja_file in \
-            "$ANDROID_BUILD_TOP/out/soong/build.ninja" \
-            "$BUILD_NINJA"; do
-            if [ -s "$ninja_file" ]; then
-              if grep -n -m 20 -E 'remoteexecution-client/.*/rewrapper|(^|[ /])rewrapper([ "]|$)' \
-                "$ninja_file" \
-                | tee -a /tmp/rbe-test/rewrapper-ninja-matches.txt; then
-                FOUND_REWRAPPER=1
-              fi
-            fi
-          done
-
-          if [ "$FOUND_REWRAPPER" -ne 1 ]; then
-            echo "::error::RBE is enabled, but no rewrapper command was found in the generated Ninja graph."
-            echo "This means the C/C++ actions are not actually being routed through reclient."
-            exit 1
+          SOONG_NINJA="$ANDROID_BUILD_TOP/out/soong/build.${TARGET_PRODUCT}.ninja"
+          RBE_GRAPH_MATCHES=/tmp/rbe-test/rewrapper-ninja-matches.txt
+          RBE_PROBE_LOG=/tmp/rbe-test/rbe-compile-command.txt
+          RBE_SAMPLE_TARGET_FILE=/tmp/rbe-test/rbe-sample-target.txt
+          echo '=== VERIFY ACTUAL SOONG AND COMBINED NINJA FILES ==='
+          if [ ! -s "$SOONG_NINJA" ]; then
+            echo "::error::Primary Soong Ninja graph missing: $SOONG_NINJA"
+            find out/soong -maxdepth 1 -name '*ninja' -print || true
+            exit 73
           fi
+          test -s "$BUILD_NINJA"
+          stat -c '%n bytes=%s' "$SOONG_NINJA" "$BUILD_NINJA"
+          {
+            printf 'primary_soong_ninja=%s\ncombined_ninja=%s\n' "$SOONG_NINJA" "$BUILD_NINJA"
+            echo '=== References in actual primary Soong graph (diagnostic only) ==='
+            grep -n -m 30 -E 'rewrapper|remoteexecution-client|RBE_' "$SOONG_NINJA" || true
+          } > "$RBE_GRAPH_MATCHES"
+          sed -n '1,35p' "$RBE_GRAPH_MATCHES"
 
-          # Reclient 0.57+ understands working-directory-relative outputs.
-          # No rewrapper output-directory shim is installed: the Remote
-          # Execution API requires output paths relative to working_directory.
-          echo "=== PINNED RECLIENT OUTPUT PATH CHECK ==="
+          # ninja -t commands expands variables and includes subninja references.
+          # Only a C/C++ *compile command* using rewrapper is a valid pass.
+          # Stream target inventory: never load the huge graph/target list in RAM.
+          echo '=== VERIFY EXPANDED LIBBASE C/C++ COMMAND ==='
+          cat > /tmp/rbe-test/rbe_graph_probe.py <<'PYRBEGRAPH'
+          #!/usr/bin/env python3
+          """Lightweight Ninja graph probe for Android libbase remote C/C++ compilation.
+          
+          Runs ninja query tools only: never compiles anything.
+          """
+          import pathlib
+          import re
+          import subprocess
+          import sys
+          
+          
+          def is_wrapped_command(command):
+              return bool(
+                  re.search(r"(?:^|[\s;/])(?:[^\s;]*/)?rewrapper(?=[\s;]|$)", command)
+                  and re.search(r"(?:clang\+\+|\bclang\b|\bg\+\+\b|\bgcc\b)", command)
+                  and re.search(r"--exec_strategy=(?:\"?remote\"?)(?=[\s;]|$)", command)
+              )
+          
+          
+          def post_build(graph, report, target_file):
+              folder = pathlib.Path("out/soong/.intermediates/system/libbase/libbase")
+              chosen = target_file.read_text().strip() if target_file.exists() else ""
+              built = []
+              if chosen and pathlib.Path(chosen).is_file() and pathlib.Path(chosen).stat().st_size:
+                  built.append(pathlib.Path(chosen))
+              if folder.is_dir():
+                  for target in folder.rglob("*.o"):
+                      if target.is_file() and target.stat().st_size and target not in built:
+                          built.append(target)
+                          if len(built) >= 20:
+                              break
+              for file in built:
+                  command = subprocess.run(
+                      ["ninja", "-f", str(graph), "-t", "commands", "-s", str(file)],
+                      capture_output=True, text=True, errors="replace", timeout=120,
+                  )
+                  if command.returncode == 0 and is_wrapped_command(command.stdout.strip()):
+                      with report.open("a") as f:
+                          f.write("\npost_build_verdict=PASS_WRAPPED_OBJECT_BUILT\n")
+                          f.write("post_build_proof_object=" + str(file) + "\n")
+                          f.write("post_build_proof_bytes=" + str(file.stat().st_size) + "\n")
+                      target_file.write_text(str(file) + "\n")
+                      print("Confirmed actual compiled object with rewrapper command: " + str(file))
+                      return 0
+              with report.open("a") as f:
+                  f.write("\nERROR=no compiled libbase C/C++ object with expanded rewrapper command\n")
+              return 73
+          
+          
+          def main():
+              graph = pathlib.Path(sys.argv[1])
+              report = pathlib.Path(sys.argv[2])
+              target_file = pathlib.Path(sys.argv[3])
+              if len(sys.argv) > 4 and sys.argv[4] == "post-build":
+                  return post_build(graph, report, target_file)
+              out = []
+              preferred_targets = []
+              other_android_targets = []
+              fallback_targets = []
+              proc = subprocess.Popen(
+                  ["ninja", "-f", str(graph), "-t", "targets", "all"],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                  errors="replace", bufsize=1,
+              )
+              for line in proc.stdout:
+                  if not line.startswith("out/soong/.intermediates/system/libbase/libbase/"):
+                      continue
+                  target = line.partition(": ")[0]
+                  if target.endswith(".o"):
+                      if "android_arm64" in target:
+                          if len(preferred_targets) < 32:
+                              preferred_targets.append(target)
+                      elif "/android_" in target:
+                          if len(other_android_targets) < 16:
+                              other_android_targets.append(target)
+                      elif len(fallback_targets) < 16:
+                          fallback_targets.append(target)
+                      if len(preferred_targets) >= 32:
+                          break
+              if len(preferred_targets) >= 32:
+                  proc.terminate()
+                  try:
+                      proc.communicate(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                      proc.communicate()
+              else:
+                  _, err = proc.communicate()
+                  if proc.returncode:
+                      report.write_text("ninja -t targets all failed: " + err[-2000:] + "\n")
+                      return 73
+          
+              candidate_targets = preferred_targets + other_android_targets + fallback_targets
+              out.append("candidates_collected=" + str(len(candidate_targets)))
+              matched = None
+              for target in candidate_targets[:20]:
+                  result = subprocess.run(
+                      ["ninja", "-f", str(graph), "-t", "commands", "-s", target],
+                      capture_output=True, text=True, errors="replace", timeout=120,
+                  )
+                  if result.returncode:
+                      out.append("query_error=" + target + " rc=" + str(result.returncode)
+                                 + " stderr=" + result.stderr[-500:].replace("\n", " "))
+                      continue
+                  # Ninja expands variables; a literal mention of a rewrapper *path*
+                  # in a file is not evidence that a compiler action runs through it.
+                  cmd = result.stdout.strip()
+                  if is_wrapped_command(cmd):
+                      matched = (target, cmd)
+                      break
+                  out.append("not_remote=" + target + " snippet=" + cmd[:200].replace("\n", " "))
+              if not matched:
+                  out.append("ERROR: no libbase C/C++ compile command actually uses rewrapper")
+                  out.append("Inspected an expanded Ninja command, not just text matches.")
+                  report.write_text("\n".join(out) + "\n")
+                  return 73
+          
+              target, command = matched
+              target_file.write_text(target + "\n")
+              out.extend([
+                  "selected_target=" + target,
+                  "remote_strategy_expected=remote",
+                  "ninja_expanded_command=" + command[:20000],
+                  "verdict=PASS_EXPANDED_LIBBASE_CXX_COMMAND_USES_REWRAPPER",
+              ])
+              report.write_text("\n".join(out) + "\n")
+              print("Verified rewrapper in expanded C/C++ build command: " + target)
+              return 0
+          
+          
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                  pathlib.Path(sys.argv[2]).write_text("probe_exception=" + str(exc) + "\n")
+                  print("RBE command probe failed: " + str(exc), file=sys.stderr)
+                  sys.exit(73)
+          PYRBEGRAPH
+          if ! python3 /tmp/rbe-test/rbe_graph_probe.py \
+            "$BUILD_NINJA" "$RBE_PROBE_LOG" "$RBE_SAMPLE_TARGET_FILE"; then
+            cat "$RBE_PROBE_LOG" || true
+            echo '::error::No executable libbase C/C++ command routed through rewrapper.'
+            exit 73
+          fi
+          sed -n '1,8p' "$RBE_PROBE_LOG"
+          echo '=== PINNED RECLIENT OUTPUT PATH CHECK ==='
           cat /tmp/rbe-test/reclient-version.txt
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
+          # Explicitly refuse local fallback for the proof run.
+          if [ "${RBE_CXX_EXEC_STRATEGY:-}" != remote ]; then
+            echo '::error::Remote-only C/C++ strategy is required for this trial.'
+            exit 73
+          fi
+
+          # Compile libbase through the normal Soong/m entry point so that
+          # Soong manages the reproxy socket lifecycle correctly. Do NOT call
+          # Ninja standalone after m nothing: its previous reproxy has stopped.
+          mark_stage rbe-libbase-smoke
+          enforce_initial_disk_guard pre-rbe-libbase-smoke
+          echo '=== LIBBASE REAL REMOTE COMPILE SMOKE ==='
+          run_monitored_m rbe-libbase-smoke libbase \
+            /tmp/rbe-test/rbe-libbase-smoke.log \
+            /tmp/rbe-test/rbe-libbase-exit-code.txt \
+            /tmp/rbe-test/rbe-libbase-disk-stop-triggered.txt \
+            /tmp/rbe-test/rbe-libbase-time-stop-triggered.txt
+          if [ "$MONITORED_RC" -ne 0 ]; then
+            tail -n 180 /tmp/rbe-test/rbe-libbase-smoke.log || true
+            echo "::error::libbase remote compilation failed (exit $MONITORED_RC)."
+            exit "$MONITORED_RC"
+          fi
+          # Confirm one .o actually produced by this libbase smoke is also a
+          # Ninja-expanded rewrapper/clang command (not merely a graph string).
+          if ! python3 /tmp/rbe-test/rbe_graph_probe.py             "$BUILD_NINJA" "$RBE_PROBE_LOG" "$RBE_SAMPLE_TARGET_FILE" post-build; then
+            tail -n 50 "$RBE_PROBE_LOG" || true
+            echo '::error::libbase built, but no produced C/C++ object proved remote rewrapper execution.'
+            exit 73
+          fi
+          RBE_SAMPLE_TARGET="$(cat "$RBE_SAMPLE_TARGET_FILE")"
+          {
+            echo 'status=PASS'
+            echo 'target_module=libbase'
+            echo "compiled_object=$RBE_SAMPLE_TARGET"
+            echo "compiled_object_bytes=$(stat -c %s "$RBE_SAMPLE_TARGET")"
+            echo 'cxx_execution_strategy=remote'
+            echo 'expanded_cxx_command_uses_rewrapper=true'
+            echo 'libbase_build_exit_code=0'
+            echo 'note=Successful remote-only libbase smoke and on-disk C++ object with matching expanded rewrapper command. Server-side BuildBuddy metrics not independently queried.'
+          } | tee /tmp/rbe-test/rbe-libbase-verification.txt
+          echo '=== RBE SMOKE LOG STATS ==='
+          grep -aE 'RBE Stats:|Downloaded:|Uploaded:' \
+            /tmp/rbe-test/rbe-libbase-smoke.log | tail -n 25 || true
+          echo '=== RBE METRICS DIAGNOSTIC ==='
+          grep -aE 'action_counts|num_remote|remote_ex|num_records' \
+            /tmp/rbe-test/rbe_metrics.txt | tail -n 30 || true
 
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
