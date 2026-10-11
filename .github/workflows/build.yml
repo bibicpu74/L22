@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: los20-star2lte-rbe-full-rom-trial
+  group: los21-star2lte-rbe-full-rom-trial
   cancel-in-progress: false
 
 jobs:
@@ -72,7 +72,7 @@ jobs:
       SOONG_SWAP_DISK_RESERVE_GIB: "12"
 
       # P1 storage trim: worktree-only, measured with df before/after.
-      # Preserve Linux toolchains and Android 13 (API 33) reference ABI dumps.
+      # Preserve Linux toolchains and the API 33 reference ABI dumps used by this trim.
       STORAGE_TRIM_DARWIN_HOST_TOOLS: "1"
       # Experimental: keep VNDK ABI versions 32, 33 and R; remove 29..31 only.
       # Set to "0" to retain all VNDK reference dumps for stricter validation.
@@ -364,7 +364,7 @@ jobs:
       # Collect post-sync storage attribution while the tree is still clean.
       # This is diagnostic-only and does not mutate .repo, source, or out.
       # Prevent a tiny LFS pointer from reaching veridex as an invalid APK.
-      # Some Android 13 trees have WebView inside a parent Git project; resolve
+      # Some Lineage trees have WebView inside a parent Git project; resolve
       # the repository root before applying the LFS include path.
       - name: Resolve and validate Chromium WebView arm64 Git LFS
         working-directory: /home/runner/work/los
@@ -636,7 +636,7 @@ jobs:
           fi
 
           if [ "${STORAGE_TRIM_OLD_VNDK_ABI}" = 1 ]; then
-            # Android 13 uses API/VNDK 33 reference dumps; keep 32 as
+            # This storage-trim heuristic retains API/VNDK 33; keep 32 as
             # compatibility headroom, plus 33, R, files at repository root.
             # Do not remove the abi-dumps project or disable ABI checks.
             root=prebuilts/abi-dumps/vndk
@@ -650,7 +650,7 @@ jobs:
                 trim_known_path "$rel"
               done
             else
-              echo '::warning::VNDK ABI layout differs from Android 13 expectation; skipping ABI trim.'
+              echo '::warning::VNDK ABI layout differs from the expected trim layout; skipping ABI trim.'
             fi
           fi
 
@@ -706,6 +706,25 @@ jobs:
             echo "--- $file"
             sed -n '1,180p' "$file"
           done <<< "$MATCHES"
+
+      # Fail fast when the checkout does not expose Android 14 AP2A.
+      # This is the release configured by LineageOS/android_build_release,
+      # lineage-21.0; check the actual synced source rather than guessing.
+      - name: Verify LineageOS 21 release AP2A
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG=build/release/release_config_map.mk
+          RELEASE_FLAGS=build/release/build_config/ap2a.scl
+          test -s "$CONFIG" || { echo "::error::Missing $CONFIG"; exit 1; }
+          test -s "$RELEASE_FLAGS" || { echo "::error::Missing $RELEASE_FLAGS"; exit 1; }
+          if ! grep -Eq 'declare-release-config,[[:space:]]*ap2a[[:space:]]*,' "$CONFIG"; then
+            echo '::error::Release ap2a is not registered by this source tree.'
+            cat "$CONFIG"
+            exit 1
+          fi
+          echo '=== LINEAGEOS 21.0 AP2A RELEASE CONFIG VERIFIED ==='
 
       # Reclient 0.25 (2021) predates the Remote Execution API fix for
       # working-directory-relative output paths (SDK fix Nov 2021).
@@ -1174,8 +1193,8 @@ jobs:
           ls -ld prebuilts/jdk/jdk11/linux-x86 prebuilts/jdk/jdk17/linux-x86 \
             2>/dev/null || true
 
-          # LineageOS 21.0 uses PRODUCT-VARIANT format.
-          # TARGET_RELEASE and aosp_target_release are for newer build trees.
+          # LineageOS 21.0 / Android 14 requires PRODUCT-RELEASE-VARIANT.
+          # Release "ap2a" comes from build/release/release_config_map.mk.
           if [ ! -f build/envsetup.sh ]; then
             echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
             exit 1
@@ -1194,7 +1213,7 @@ jobs:
           fi
           echo '=== ENVSETUP PASSED ==='
           mark_stage lunch
-          lunch lineage_star2lte-userdebug
+          lunch lineage_star2lte-ap2a-userdebug
           LUNCH_RC=$?
           # Restore strict error checking only after the Lineage shell setup.
           set -e
@@ -1206,17 +1225,20 @@ jobs:
           echo '=== LUNCH PASSED ==='
           mark_stage java-selection
 
-          # Prefer the checked-out JDK 11 if this tree selects it.
-          # RBE and Android Soong toolchain remain otherwise unchanged.
-          if [ -x "$PWD/prebuilts/jdk/jdk11/linux-x86/bin/java" ]; then
-            export JAVA_HOME="$PWD/prebuilts/jdk/jdk11/linux-x86"
-            export PATH="$JAVA_HOME/bin:$PATH"
-          else
-            echo "::warning::Bundled JDK 11 is not present at expected path; build system will select its default JDK."
+          # Android 14 uses JDK 17. Do not force the older JDK 11 after lunch.
+          # Keep the Java variables consistent with the checked-out prebuilt.
+          JDK17="$PWD/prebuilts/jdk/jdk17/linux-x86"
+          if [ ! -x "$JDK17/bin/java" ]; then
+            echo "::error::Bundled JDK 17 is missing: $JDK17/bin/java"
+            exit 1
           fi
+          export JAVA_HOME="$JDK17"
+          export ANDROID_JAVA_HOME="$JDK17"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          "$JAVA_HOME/bin/java" -version
           export USE_CCACHE=0
           export CCACHE_DISABLE=1
-          # The Android 13 prebuilt Go toolchain may be older than Go 1.19.
+          # The checked-out Go toolchain may be older than Go 1.19.
           # GOMEMLIMIT does not exist on Go 1.18; never claim it worked there.
           export GOGC="$SOONG_GOGC"
           unset GOMEMLIMIT || true
@@ -1250,11 +1272,13 @@ jobs:
           echo "=== LINEAGE BUILD SELECTION ==="
           echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
           echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
+          echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
           echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-unset}"
           echo "TARGET_BUILD_TYPE=${TARGET_BUILD_TYPE:-unset}"
 
           if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
              [ "${TARGET_PRODUCT:-}" != "lineage_star2lte" ] || \
+             [ "${TARGET_RELEASE:-}" != "ap2a" ] || \
              [ "${TARGET_BUILD_VARIANT:-}" != "userdebug" ]; then
             echo "::error::Invalid LineageOS build configuration."
             exit 1
@@ -1816,7 +1840,7 @@ jobs:
           sha256sum "$ROM_ZIP" | tee /tmp/rbe-test/rom-sha256.txt
           basename "$ROM_ZIP" > /tmp/rbe-test/rom-filename.txt
           echo "=== FULL ROM BUILD PASSED ==="
-          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_BUILD_VARIANT}"
+          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_RELEASE}-${TARGET_BUILD_VARIANT}"
           echo 'Full bacon target completed with remote C++ compilation enabled.'
           mark_stage complete
 
