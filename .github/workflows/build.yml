@@ -1194,6 +1194,77 @@ jobs:
           echo "=== BOOTSTRAP VERSION ==="
           "$RBE_DIR/bootstrap" --version || true
 
+      # Reclient 0.172 ClangScanDeps has a reproducible preprocessor parsing
+      # failure on two Sonivox .s inputs. Keep remote-only compilation for all
+      # other actions; execute these exact two ARM assembly sources locally.
+      # Preflight Clang -E is not a substitute for real compiler smoke below.
+      - name: Route only two Sonivox ARM assembly actions around RBE scanner
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RBE_DIR:-}"
+          WRAPPER="$RBE_DIR/rewrapper"
+          REAL="$RBE_DIR/rewrapper.remote-original"
+          test -x "$WRAPPER"
+          test ! -e "$REAL"
+          mv -- "$WRAPPER" "$REAL"
+          cat > "$WRAPPER" <<'SONIVOX_REWRAPPER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          SELF_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+          REAL="$SELF_DIR/rewrapper.remote-original"
+          # Match *only* these two Sonivox sources.  All other calls go to
+          # pinned reclient unchanged, including --version and normal C/C++.
+          matched=''
+          for arg in "$@"; do
+            case "$arg" in
+              external/sonivox/arm-wt-22k/lib_src/ARM-E_filter_gnu.s|*/external/sonivox/arm-wt-22k/lib_src/ARM-E_filter_gnu.s)
+                matched=ARM-E_filter_gnu.s ;;
+              external/sonivox/arm-wt-22k/lib_src/ARM-E_mastergain_gnu.s|*/external/sonivox/arm-wt-22k/lib_src/ARM-E_mastergain_gnu.s)
+                matched=ARM-E_mastergain_gnu.s ;;
+            esac
+          done
+          if [[ -z "$matched" ]]; then
+            exec "$REAL" "$@"
+          fi
+          # Find the exact pinned clang executable in the command handed to
+          # rewrapper.  Do not parse compiler flags as rewrapper flags.
+          argv=("$@")
+          idx=0
+          while (( idx < ${#argv[@]} )); do
+            case "${argv[$idx]}" in
+              prebuilts/clang/host/linux-x86/*/bin/clang|prebuilts/clang/host/linux-x86/*/bin/clang|prebuilts/clang/host/linux-x86/*/bin/clang++)
+                break ;;
+            esac
+            idx=$((idx + 1))
+          done
+          if (( idx >= ${#argv[@]} )); then
+            echo "SONIVOX_ASM_LOCAL_ERROR no pinned clang command found: $matched" >&2
+            exit 86
+          fi
+          compiler="${argv[$idx]}"
+          if [[ ! -x "$compiler" ]]; then
+            echo "SONIVOX_ASM_LOCAL_ERROR compiler not executable: $compiler" >&2
+            exit 86
+          fi
+          echo "SONIVOX_ASM_LOCAL_COMPILE: $matched using $compiler" >&2
+          printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$matched" "$compiler" \
+            >> /tmp/rbe-test/sonivox-local-assembly.tsv
+          exec "${argv[@]:idx}"
+          SONIVOX_REWRAPPER
+          chmod 0755 "$WRAPPER"
+          test -x "$REAL"
+          test -x "$WRAPPER"
+          "$WRAPPER" --version > /tmp/rbe-test/sonivox-wrapper-version.txt 2>&1 || true
+          {
+            echo 'mode=local-only-exact-sonivox-arm-assembly'
+            echo "rewrapper_shim=$WRAPPER"
+            echo "pinned_original=$REAL"
+            echo 'sources=ARM-E_filter_gnu.s,ARM-E_mastergain_gnu.s'
+            echo 'other_actions=unchanged-reclient-remote-only'
+          } | tee /tmp/rbe-test/sonivox-assembly-fallback.txt
+
       - name: Check BuildBuddy network connectivity
         working-directory: /home/runner/work/los
         shell: bash
