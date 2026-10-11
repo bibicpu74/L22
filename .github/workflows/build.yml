@@ -58,13 +58,13 @@ jobs:
 
       # Soong graph generation is local even with BuildBuddy RBE.
       # Go GC is tuned for the standard ~16-GB GitHub runner.
-      # P0: lower Go GC target; limit only activates with Go >= 1.19.
+      # P0: GC target for the direct Go runtime patch in soong_build/main.go.
       SOONG_GOGC: "25"
       SOONG_GOMEMLIMIT: "6GiB"
       # Limit active Go workers during the memory-heavy graph generation only.
       SOONG_GRAPH_GOMAXPROCS: "2"
-      # Diagnostic trial: trace Go GC during Soong graph only (not bacon).
-      # Raw traces are in m-nothing.log; a compact tail is also extracted.
+      # Bootstrap Go helpers get gctrace where environment is inherited.
+      # Primary Soong telemetry comes from direct runtime.MemStats samples.
       SOONG_GRAPH_GC_TRACE: "1"
       SOONG_GRAPH_GC_TAIL_LINES: "200"
       # Stop before RAM and disk swap are both exhausted. This protects the
@@ -742,6 +742,110 @@ jobs:
       # Ubuntu 24.04 ships ncurses6; legacy RenderScript Clang needs ncurses5.
       # Use the matching Jammy security packages, pinned with checksums from
       # packages.ubuntu.com, instead of making unsafe SONAME symlinks.
+
+      # P0/P1: AOSP launches the main graph tool via `env -i`. Go environment
+      # exports from GitHub Actions therefore do not reliably reach it.
+      # Apply GC controls inside the real `soong_build` process instead.
+      - name: Configure primary Soong Go runtime and heap telemetry
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbe-test
+          python3 - <<'PYGO'
+          import pathlib
+          import re
+          import subprocess
+          import os
+          import sys
+
+          go = pathlib.Path('prebuilts/go/linux-x86/bin/go').resolve()
+          gofmt = pathlib.Path('prebuilts/go/linux-x86/bin/gofmt').resolve()
+          target = pathlib.Path('build/soong/cmd/soong_build/main.go')
+          log = pathlib.Path('/tmp/rbe-test/soong-go-runtime-patch.txt')
+          if not (target.is_file() and go.is_file() and gofmt.is_file()):
+              sys.exit('ERROR: Soong main.go or the Go toolchain is missing')
+          version = subprocess.check_output([str(go), 'version'], text=True).strip()
+          m = re.search(r'\bgo(\d+)\.(\d+)', version)
+          if not m or tuple(map(int, m.groups())) < (1, 19):
+              sys.exit('ERROR: Go >=1.19 required for debug.SetMemoryLimit')
+          gogc = int(os.environ['SOONG_GOGC'])
+          maxprocs = int(os.environ['SOONG_GRAPH_GOMAXPROCS'])
+          mem = re.fullmatch(r'(\d+)GiB', os.environ['SOONG_GOMEMLIMIT'])
+          if not mem or not (1 <= gogc <= 200 and 1 <= maxprocs <= 16):
+              sys.exit('ERROR: invalid GC settings')
+          mem_bytes = int(mem.group(1)) * 1024**3
+          if not (1024**3 <= mem_bytes <= 64*1024**3):
+              sys.exit('ERROR: unreasonable soft memory limit')
+
+          before = target.read_text()
+          if before.count('func main() {') != 1 or before.count('import (') != 1:
+              sys.exit('ERROR: unexpected Soong main.go layout')
+          if 'SOONG_GO_RUNTIME_APPLIED' in before:
+              sys.exit('ERROR: Soong main.go is already instrumented')
+          for imp in ('runtime', 'runtime/debug'):
+              if f'"{imp}"' not in before:
+                  before = before.replace('import (', f'import (\n    "{imp}"', 1)
+
+          # Apply tuning after flag.Parse and before expensive graph work.
+          # The process is started with an empty environment by design.
+          # The exporter samples genuine Go heap, not RSS or VmSwap.
+          code = fr"""
+          // SOONG_GC_CI_TRIAL: only applies to primary --soong_variables graph.
+          func configureSoongGraphRuntimeCI() {{
+              graph := false
+              for _, arg := range os.Args[1:] {{
+                  if arg == "--soong_variables" || arg == "-soong_variables" || strings.HasPrefix(arg, "--soong_variables=") {{
+                      graph = true
+                      break
+                  }}
+              }}
+              if !graph {{ return }}
+              runtime.GOMAXPROCS({maxprocs})
+              debug.SetGCPercent({gogc})
+              debug.SetMemoryLimit(int64({mem_bytes}))
+              fmt.Fprintf(os.Stderr, "SOONG_GO_RUNTIME_APPLIED pid=%d GOGC={gogc} GOMEMLIMIT={mem_bytes}B GOMAXPROCS={maxprocs}\n", os.Getpid())
+              out, err := os.OpenFile("/tmp/rbe-test/soong-go-heap.tsv", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+              if err != nil {{
+                  fmt.Fprintf(os.Stderr, "SOONG_GO_TELEMETRY_OPEN_FAILED: %v\n", err)
+                  return
+              }}
+              capture := func() {{
+                  var ms runtime.MemStats
+                  runtime.ReadMemStats(&ms)
+                  fmt.Fprintf(out, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+                      time.Now().UTC().Format(time.RFC3339), os.Getpid(),
+                      ms.HeapAlloc, ms.HeapSys, ms.HeapInuse, ms.HeapReleased,
+                      ms.Sys, ms.StackSys, ms.NumGC)
+                  out.Sync()
+              }}
+              capture()
+              go func() {{
+                  ticker := time.NewTicker(10 * time.Second)
+                  defer ticker.Stop()
+                  defer out.Close()
+                  for range ticker.C {{ capture() }}
+              }}()
+          }}
+          """
+          injected = before.replace('func main() {', code + '\nfunc main() {', 1)
+          # Configure before parsing/building the graph; flag.Parse is cheap.
+          injected = injected.replace('func main() {', 'func main() {\n    configureSoongGraphRuntimeCI()', 1)
+          if injected.count('SOONG_GO_RUNTIME_APPLIED') != 1:
+              sys.exit('ERROR: failed to inject runtime instrumentation')
+          target.write_text(injected)
+          subprocess.run([str(gofmt), '-w', str(target)], check=True)
+          formatted = target.read_text()
+          if formatted.count('SOONG_GO_RUNTIME_APPLIED') != 1:
+              sys.exit('ERROR: formatted Go source missing instrumentation')
+          log.write_text(f'go_version={version}\nsource={target}\n' +
+                         f'GOGC={gogc}\nGOMEMLIMIT={mem_bytes}B\nGOMAXPROCS={maxprocs}\n' +
+                         'method=runtime.GOMAXPROCS + debug.SetGCPercent + debug.SetMemoryLimit\n' +
+                         'telemetry=/tmp/rbe-test/soong-go-heap.tsv (10 second intervals)\n' +
+                         'applies_only_to=primary_graph_with_--soong_variables\n')
+          print(log.read_text())
+          PYGO
+
       - name: Install and verify legacy ncurses5 for RenderScript
         working-directory: /home/runner/work/los
         shell: bash
@@ -1551,6 +1655,31 @@ jobs:
               "$(cgroup_event_value oom)" "$(cgroup_event_value oom_kill)" \
               >> "$SOONG_MEMORY_TSV"
           }
+          # P0: optional observation of the actual primary builder environment.
+          # Unlike the direct Go runtime API patch, these variables are expected
+          # to be absent from the `env -i` command. Never dump all environ.
+          SOONG_ENV_OBSERVED=/tmp/rbe-test/soong-proc-environ.tsv
+          printf 'timestamp\tpid\tGOGC\tGOMEMLIMIT\tGOMAXPROCS\tGODEBUG\n' > "$SOONG_ENV_OBSERVED"
+          ENV_OBSERVED_PIDS=' '
+          observe_primary_soong_environment() {
+            local pid envtext gc limit procs debug
+            while IFS= read -r pid; do
+              [ -r "/proc/$pid/status" ] || continue
+              if [[ "$ENV_OBSERVED_PIDS" == *" $pid "* ]]; then continue; fi
+              if ! grep -aFq -- '--soong_variables' "/proc/$pid/cmdline" 2>/dev/null; then continue; fi
+              [ -r "/proc/$pid/environ" ] || continue
+              envtext="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)"
+              gc="$(printf '%s\n' "$envtext" | sed -n 's/^GOGC=//p' | head -n1)"
+              limit="$(printf '%s\n' "$envtext" | sed -n 's/^GOMEMLIMIT=//p' | head -n1)"
+              procs="$(printf '%s\n' "$envtext" | sed -n 's/^GOMAXPROCS=//p' | head -n1)"
+              debug="$(printf '%s\n' "$envtext" | sed -n 's/^GODEBUG=//p' | head -n1)"
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$pid" \
+                "${gc:-absent}" "${limit:-absent}" "${procs:-absent}" "${debug:-absent}" \
+                >> "$SOONG_ENV_OBSERVED"
+              ENV_OBSERVED_PIDS="${ENV_OBSERVED_PIDS}${pid} "
+            done < <(pgrep -x soong_build 2>/dev/null || true)
+          }
           # PID-level CPU information, not the wrapper bash process CPU.
           # %CPU is procps' lifetime-average, not an instantaneous sample.
           SOONG_PROCESS_TSV=/tmp/rbe-test/soong-process-samples.tsv
@@ -1604,7 +1733,8 @@ jobs:
               if [ "$phase" = build-graph ]; then
                 export GOMAXPROCS="$SOONG_GRAPH_GOMAXPROCS"
                 if [ "$SOONG_GRAPH_GC_TRACE" = 1 ]; then
-                  # Inherited by Soong's Go processes; not enabled for bacon.
+                  # May reach bootstrap helpers, not the env -i primary builder.
+                  # Primary builder has direct in-process GC configuration.
                   export GODEBUG="${GODEBUG:+${GODEBUG},}gctrace=1"
                 fi
                 echo "=== SOONG GRAPH GO RUNTIME: GOGC=$GOGC GOMAXPROCS=$GOMAXPROCS GOMEMLIMIT=${GOMEMLIMIT:-not-supported} GC_TRACE=$SOONG_GRAPH_GC_TRACE ==="
@@ -1648,6 +1778,13 @@ jobs:
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
               sample_soong_memory "$phase"
               sample_soong_processes "$phase"
+              if [ "$phase" = build-graph ]; then
+                observe_primary_soong_environment
+                if [ -s /tmp/rbe-test/soong-go-heap.tsv ] && (( sample_counter % 6 == 0 )); then
+                  echo '=== ACTUAL PRIMARY SOONG GO HEAP (last sample, bytes) ==='
+                  tail -n 1 /tmp/rbe-test/soong-go-heap.tsv || true
+                fi
+              fi
               # Live Actions log survives more cancellation scenarios than
               # artifact upload. No arguments/credentials are printed.
               if [ "$phase" = build-graph ]; then
@@ -1769,6 +1906,15 @@ jobs:
             tail -n 180 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
             echo "::error::Soong build graph failed or was stopped (exit $MONITORED_RC)."
             exit "$MONITORED_RC"
+          fi
+          # Verify the instrumentation actually ran inside the primary graph.
+          # A successful cached graph is valid too, but this fresh-run workflow
+          # expects the telemetry marker unless Soong skipped regeneration.
+          if [ -s /tmp/rbe-test/soong-go-heap.tsv ]; then
+            echo '=== PRIMARY SOONG IN-PROCESS GC CONFIRMED ==='
+            tail -n 3 /tmp/rbe-test/soong-go-heap.tsv || true
+          else
+            echo '::warning::No in-process Go heap sample recorded; inspect m-nothing.log and Soong regeneration.'
           fi
           # Soong's memory-heavy graph is complete. The prior run left only
           # ~19 MiB used inside the 8-GiB graph-only swap file, but did not
@@ -2259,6 +2405,12 @@ jobs:
           echo "=== RBE METRICS ==="
           cat /tmp/rbe-test/rbe_metrics.txt 2>/dev/null || true
 
+          echo '=== PRIMARY SOONG RUNTIME PATCH ==='
+          cat /tmp/rbe-test/soong-go-runtime-patch.txt 2>/dev/null || true
+          echo '=== SOONG GC HEAP SAMPLES ==='
+          tail -n 30 /tmp/rbe-test/soong-go-heap.tsv 2>/dev/null || true
+          echo '=== PRIMARY SOONG PROCESS ENVIRONMENT (WHITELISTED) ==='
+          cat /tmp/rbe-test/soong-proc-environ.tsv 2>/dev/null || true
           echo "=== BUILD GRAPH LOG TAIL ==="
           tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
 
