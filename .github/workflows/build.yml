@@ -53,7 +53,12 @@ jobs:
       RBE_proxy_log_dir: "/tmp/rbe-test"
       RBE_output_dir: "/tmp/rbe-test"
       RBE_reproxy_wait_seconds: "30"
-      RBE_v: "2"
+      RBE_v: "0"
+      # RBE logs are written into the compressed workspace through /tmp/rbe-test.
+      # Keep provenance and clean older Git object packs only after graph generation.
+      SAFE_GIT_OBJECT_TRIM: "1"
+      RBE_INFO_KEEP_MIB: "4"
+      RBE_RRPL_KEEP_MIB: "32"
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
       # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
@@ -240,6 +245,30 @@ jobs:
             exit 70
           fi
 
+      - name: Relocate CI and reproxy diagnostics into Android workspace
+        working-directory: /home/runner/work
+        shell: bash
+        run: |
+          set -euo pipefail
+          # RBE uses /tmp/rbe-test internally. Place its backing directory under
+          # the existing compressed Btrfs workspace so INFO/rrpl do not fill /tmp.
+          # Also works in plain mode; the reduction is compression-dependent.
+          DST=/home/runner/work/los/.rbe-diagnostics
+          test -d /home/runner/work/los
+          mkdir -p "$DST"
+          if [ -L /tmp/rbe-test ]; then
+            test "$(readlink -f /tmp/rbe-test)" = "$DST"
+          else
+            test -d /tmp/rbe-test
+            cp -a /tmp/rbe-test/. "$DST/"
+            rm -rf -- /tmp/rbe-test
+            ln -s "$DST" /tmp/rbe-test
+          fi
+          echo "diagnostic_realpath=$(readlink -f /tmp/rbe-test)"             > /tmp/rbe-test/diagnostic-location.txt
+          df -hT / "$DST"
+          findmnt -T "$DST" -o SOURCE,FSTYPE,OPTIONS
+          echo 'Reproxy diagnostics are now stored in the Android workspace.'
+
       - name: Repo init and install local manifest
         working-directory: /home/runner/work
         shell: bash
@@ -290,12 +319,34 @@ jobs:
             exit 1
           fi
 
-          cat > .repo/local_manifests/zz-storage-trim.xml <<'EOFTRIM'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <manifest>
-              <remove-project path="prebuilts/remoteexecution-client" optional="true" />
-          </manifest>
-          EOFTRIM
+          # Discover actual manifest project names, never assume name=path.
+          # Only remove the explicit Linux-irrelevant host entries, if present.
+          repo manifest -o /tmp/rbe-test/pre-storage-trim-manifest.xml
+          python3 - <<'PYHOSTTRIM'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          tree=ET.parse('/tmp/rbe-test/pre-storage-trim-manifest.xml')
+          seen={p.get('path',p.get('name')):p.get('name')
+                for p in tree.getroot().findall('.//project')}
+          targets=['prebuilts/remoteexecution-client',
+                   'prebuilts/clang/host/darwin-x86',
+                   'prebuilts/android-emulator',
+                   'prebuilts/bazel/darwin-x86_64',
+                   'prebuilts/go/darwin-x86']
+          if 'prebuilts/remoteexecution-client' not in seen:
+              raise SystemExit('Required RBE project not found before trim')
+          root=ET.Element('manifest')
+          for target in targets:
+              name=seen.get(target)
+              if name:
+                  ET.SubElement(root,'remove-project',{'name':name,'optional':'true'})
+                  print(f'Safe manifest removal: {target} -> {name}')
+              else:
+                  print(f'Already absent from manifest: {target}')
+          out=Path('.repo/local_manifests/zz-storage-trim.xml')
+          ET.indent(root,space='    ')
+          ET.ElementTree(root).write(out,encoding='UTF-8',xml_declaration=True)
+          PYHOSTTRIM
 
           repo list -a -p > /tmp/rbe-test/manifest-projects-after-trim.txt
           if grep -Fxq 'prebuilts/remoteexecution-client' \
@@ -375,11 +426,92 @@ jobs:
           echo "=== POST-SYNC DISK ==="
           df -h / /home/runner/work/los
 
+      - name: Capture locked source manifest before checkout modifications
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=/tmp/rbe-test/source-manifest-locked.xml
+          repo manifest -r -o "$FILE"
+          python3 - "$FILE" <<'PYLOCK'
+          import sys, xml.etree.ElementTree as ET
+          root=ET.parse(sys.argv[1]).getroot()
+          projects=root.findall('.//project')
+          if root.tag != 'manifest' or len(projects) < 100:
+              raise SystemExit('Locked manifest unexpectedly empty or too small')
+          bad=[p.get('path') or p.get('name') for p in projects
+               if not p.get('revision')]
+          if bad: raise SystemExit('Missing pinned revision: '+str(bad[:5]))
+          print(f'Locked source manifest contains {len(projects)} projects')
+          PYLOCK
+          sha256sum "$FILE" > /tmp/rbe-test/source-manifest-locked.sha256
+
       # Collect post-sync storage attribution while the tree is still clean.
       # This is diagnostic-only and does not mutate .repo, source, or out.
       # Prevent a tiny LFS pointer from reaching veridex as an invalid APK.
       # Some Lineage trees have WebView inside a parent Git project; resolve
       # the repository root before applying the LFS include path.
+      - name: Sonivox ARM preflight and narrowly guarded source fix
+        working-directory: /home/runner/work/los
+        shell: bash
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          SRC=external/sonivox/arm-wt-22k/lib_src
+          INC="$SRC/ARM_synth_constants_gnu.inc"
+          CLANG=prebuilts/clang/host/linux-x86/clang-r510928/bin/clang
+          LOG=/tmp/rbe-test/sonivox-preflight.log
+          mkdir -p /tmp/rbe-test
+          exec > >(tee "$LOG") 2>&1
+          test -s "$INC"
+          test -x "$CLANG"
+          echo '=== SONIVOX SOURCE CHECK, LINE 70-115 ==='
+          nl -ba "$INC" | sed -n '70,115p'
+          # This is deliberately a *single* syntax repair. Do not rewrite
+          # all assembler conditionals or disable dependency scanning globally.
+          python3 - "$INC" <<'PYSONIVOX'
+          from pathlib import Path
+          import sys, re, difflib
+          path = Path(sys.argv[1]); orig = path.read_text()
+          lines = orig.splitlines(keepends=True)
+          # Track CPP conditional depth; assembler .if/.endif are distinct.
+          depth = 0; orphans = []
+          for i, line in enumerate(lines):
+              if re.match(r'^\s*#\s*(?:if|ifdef|ifndef)\b',line):
+                  depth += 1
+              elif re.match(r'^\s*#\s*endif\b',line):
+                  if depth: depth -= 1
+                  else: orphans.append(i)
+          print('orphan_cpp_endif_lines=', [i+1 for i in orphans])
+          if not orphans:
+              print('No unmatched #endif; no patch needed')
+              sys.exit(0)
+          # Apply only the known reported location and only if its corresponding
+          # assembler conditional is visible in this same source section.
+          if len(orphans) != 1 or orphans[0] != 97:
+              sys.exit('Unexpected Sonivox CPP imbalance; refuse speculative patch')
+          i = orphans[0]
+          if not re.fullmatch(r'\s*#\s*endif\s*(?:\r?\n)?',lines[i]):
+              sys.exit('Unexpected line 98 content; refusing patch')
+          # Assembler .if uses --defsym values; the closing line must be .endif.
+          if not any(re.match(r'^\s*\.if\b',lines[j]) for j in range(max(0,i-60),i)):
+              sys.exit('No nearby assembler .if to match; refusing patch')
+          lines[i] = re.sub(r'#\s*endif', '.endif', lines[i], count=1)
+          repaired=''.join(lines)
+          for ln in difflib.unified_diff(orig.splitlines(True),repaired.splitlines(True),fromfile='original',tofile='sonivox-guarded-fix'):
+              print(ln,end='')
+          path.write_text(repaired)
+          PYSONIVOX
+          echo '=== REAL CLANG CPP VALIDATION ==='
+          # Preprocessor path matches -xassembler-with-cpp; use the same source
+          # files and include tree as the failing ARM objects.
+          for name in ARM-E_filter_gnu ARM-E_mastergain_gnu; do
+            "$CLANG" -E -x assembler-with-cpp -target armv7a-linux-androideabi10000               -I"$SRC" "$SRC/$name.s"               -o "/tmp/rbe-test/${name}.preprocessed.s"
+            test -s "/tmp/rbe-test/${name}.preprocessed.s"
+          done
+          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc             > /tmp/rbe-test/sonivox-fix.patch || true
+          echo 'SONIVOX_CPP_PREFLIGHT_PASSED'
+
       - name: Resolve and validate Chromium WebView arm64 Git LFS
         working-directory: /home/runner/work/los
         shell: bash
@@ -2020,21 +2152,107 @@ jobs:
           fi
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
           df -h /home/runner/work/los
-          echo "=== CLEANING UP GIT OBJECTS TO SAVE SPACE ==="
-          # Remove massive git object databases that we don't need for the build
-          # The files remain checked out in the working directory, so Soong won't fail!
-          rm -rf .repo/project-objects/platform/prebuilts/abi-dumps/*.git || true
-          rm -rf .repo/project-objects/platform/prebuilts/rust.git || true
-          rm -rf .repo/project-objects/platform/prebuilts/gradle-plugin.git || true
-          rm -rf .repo/project-objects/platform/prebuilts/sdk.git || true
-          rm -rf .repo/project-objects/LineageOS/android_cts.git || true
-          rm -rf .repo/project-objects/platform/external/deqp.git || true
-          mv .repo/repo/repo .repo/repo/repo.bak || true
-          echo -e '#!/usr/bin/env python3
-          print("<manifest></manifest>")' > .repo/repo/repo
-          chmod +x .repo/repo/repo
-          
-          echo "=== DISK SPACE AFTER GIT OBJECTS CLEANUP ==="
+          mark_stage safe-git-objects-cleanup
+          echo '=== LOCKED MANIFEST + CONTROLLED GIT STORAGE RECLAIM ==='
+          LOCK=/tmp/rbe-test/source-manifest-locked.xml
+          test -s "$LOCK"
+          sha256sum -c /tmp/rbe-test/source-manifest-locked.sha256
+          # Capture local CI-only changes not represented by pinned commit hashes.
+          git -C build/soong diff -- cmd/soong_build/main.go             > /tmp/rbe-test/soong-gc-direct.patch || true
+          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc             > /tmp/rbe-test/sonivox-fix.patch || true
+          # Preserve the exact repo implementation; do not replace it with an
+          # empty or fabricated manifest. Only redirect the one manifest query
+          # to the real locked snapshot after deleting Git object packs.
+          if [ "${SAFE_GIT_OBJECT_TRIM}" = "1" ]; then
+            REAL=.repo/repo/repo
+            test -s "$REAL"
+            if [ ! -e "${REAL}.before-ci-cleanup" ]; then
+              cp -p "$REAL" "${REAL}.before-ci-cleanup"
+            fi
+            python3 - "$REAL" "$LOCK" <<'PYREPOBRIDGE'
+          from pathlib import Path
+          import sys
+          exe=Path(sys.argv[1]); source=Path(sys.argv[2])
+          original=exe.with_name(exe.name+'.before-ci-cleanup')
+          assert original.is_file() and source.is_file()
+          code="""#!/usr/bin/env python3
+          import os, sys
+          from pathlib import Path
+          args=sys.argv[1:]
+          # Return the ORIGINAL pinned manifest, never an empty placeholder.
+          if args and args[0]=='manifest' and '-r' in args and all(
+             a in ('manifest','-r','--revision-as-HEAD','-o','-') or a.endswith('.xml')
+             for a in args):
+              data=Path({source!r}).read_bytes()
+              if '-o' in args:
+                  idx=args.index('-o')
+                  if idx+1 >= len(args): sys.exit('Missing -o file')
+                  dst=args[idx+1]
+                  if dst=='-': sys.stdout.buffer.write(data)
+                  else: Path(dst).write_bytes(data)
+              else: sys.stdout.buffer.write(data)
+              sys.exit(0)
+          os.execv(sys.executable,[sys.executable,{orig!r}]+args)
+          """.format(source=str(source.resolve()),orig=str(original.resolve()))
+          exe.write_text(code)
+          exe.chmod(0o755)
+          PYREPOBRIDGE
+            # Verify the exact repo command previously failing in build-manifest.
+            python3 "$REAL" manifest -r > /tmp/rbe-test/manifest-wrapper-probe.xml
+            cmp -s "$LOCK" /tmp/rbe-test/manifest-wrapper-probe.xml
+            echo 'Real locked manifest returned by repo manifest -r compatibility shim.'
+            # Worktree remains unchanged; deleting the Git object stores can
+            # disable regular Git commands for these projects. No sync follows.
+            cat > /tmp/rbe-test/git-trim-targets.txt <<'EOFTRIMTARGETS'
+          .repo/project-objects/platform/prebuilts/rust.git
+          .repo/project-objects/platform/prebuilts/gradle-plugin.git
+          .repo/project-objects/platform/prebuilts/sdk.git
+          .repo/project-objects/LineageOS/android_cts.git
+          .repo/project-objects/platform/external/deqp.git
+          EOFTRIMTARGETS
+            ROOT_BEFORE="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+            IMAGE_BEFORE="$(stat -c '%b %B' "$BTRFS_BACKING" 2>/dev/null || echo '0 0')"
+            printf 'target\tlogical_bytes_before\tstatus\n' > /tmp/rbe-test/git-cleanup-sizes.tsv
+            while IFS= read -r candidate; do
+              [ -n "$candidate" ] || continue
+              # Exact allowlist. No dynamic paths and never delete .repo/repo.
+              case "$candidate" in
+                .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git) ;;
+                *) echo "::error::Refusing unexpected Git trim path: $candidate"; exit 1 ;;
+              esac
+              if [ -L "$candidate" ]; then
+                echo "Skip symlink: $candidate"
+                continue
+              fi
+              if [ -d "$candidate" ]; then
+                kib="$(du -sk "$candidate" | awk '{print $1}')"
+                printf '%s\t%s\tremoved\n' "$candidate" "$((kib*1024))"                   >> /tmp/rbe-test/git-cleanup-sizes.tsv
+                rm -rf -- "$candidate"
+              fi
+            done < /tmp/rbe-test/git-trim-targets.txt
+            # abi-dumps has subprojects; remove only its direct *.git dirs.
+            find .repo/project-objects/platform/prebuilts/abi-dumps -mindepth 1               -maxdepth 1 -type d -name '*.git' -print0 2>/dev/null               | while IFS= read -r -d '' d; do
+                  du -sk "$d" || true
+                  rm -rf -- "$d"
+                done || true
+            ROOT_AFTER="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+            echo "host_free_delta_after_git_delete_bytes=$((ROOT_AFTER-ROOT_BEFORE))"               | tee /tmp/rbe-test/git-storage-delta.txt
+            echo "btrfs_image_allocated_before_blocks_and_blocksize=$IMAGE_BEFORE"               >> /tmp/rbe-test/git-storage-delta.txt
+            stat -c 'btrfs_image_after_blocks=%b blocksize=%B' "$BTRFS_BACKING"               >> /tmp/rbe-test/git-storage-delta.txt 2>/dev/null || true
+            sha256sum -c /tmp/rbe-test/source-manifest-locked.sha256
+          else
+            echo 'SAFE_GIT_OBJECT_TRIM=0: preserving Git metadata.'
+          fi
+          # fstrim works only if discard passes through the mounted loop and
+          # backing filesystem. A no-op/failure must never fail the ROM build.
+          if (( BTRFS_ACTIVE == 1 )); then
+            echo '=== OPTIONAL POST-CLEANUP BTRFS DISCARD ==='
+            du -h "$BTRFS_BACKING" || true
+            lsblk -D | head -n 20 || true
+            sudo timeout 90s fstrim -v "$ANDROID_BUILD_TOP"               > /tmp/rbe-test/btrfs-fstrim.log 2>&1 || true
+            du -h "$BTRFS_BACKING" || true
+          fi
+          echo '=== STORAGE AFTER GIT OBJECTS CLEANUP ==='
           df -h / /home/runner/work/los
           enforce_initial_disk_guard post-graph
 
@@ -2293,6 +2511,26 @@ jobs:
           echo '=== RBE METRICS DIAGNOSTIC ==='
           grep -aE 'action_counts|num_remote|remote_ex|num_records' \
             /tmp/rbe-test/rbe_metrics.txt | tail -n 30 || true
+
+          # Run Sonivox through actual Soong/RBE early, not 74 minutes into
+          # the ROM build. This checks the assembler path, not just Clang -E.
+          mark_stage rbe-sonivox-smoke
+          echo '=== SONIVOX ARM/RBE COMPILE SMOKE ==='
+          run_monitored_m rbe-sonivox-smoke libsonivox \
+            /tmp/rbe-test/rbe-sonivox-smoke.log \
+            /tmp/rbe-test/rbe-sonivox-exit-code.txt \
+            /tmp/rbe-test/rbe-sonivox-disk-stop-triggered.txt \
+            /tmp/rbe-test/rbe-sonivox-time-stop-triggered.txt
+          if [ "$MONITORED_RC" -ne 0 ]; then
+            echo '=== SONIVOX SCANNER / ASSEMBLER ERRORS ==='
+            grep -anE -m 80 'ARM_synth_constants_gnu|#endif without #if|ARM-E_filter_gnu|ARM-E_mastergain_gnu|processing inputs failed|error:' \
+              /tmp/rbe-test/rbe-sonivox-smoke.log | cut -c 1-450 \
+              > /tmp/rbe-test/sonivox-smoke-errors.txt || true
+            tail -n 100 /tmp/rbe-test/sonivox-smoke-errors.txt || true
+            echo "::error::Sonivox did not compile (exit $MONITORED_RC); build ROM not started."
+            exit "$MONITORED_RC"
+          fi
+          echo 'SONIVOX_RBE_SMOKE_PASSED' | tee /tmp/rbe-test/sonivox-smoke-result.txt
 
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
@@ -2645,6 +2883,10 @@ jobs:
             /tmp/rbe-test \
             --exclude=full-rom-build.log \
             --exclude=m-nothing.log \
+            --exclude='*.rrpl' \
+            --exclude='*.rpi' \
+            --exclude='*.INFO*' \
+            --exclude='*.pb' \
             2>/dev/null | head -100 || true
 
           echo "=== RBE METRICS ==="
@@ -2737,26 +2979,89 @@ jobs:
           rm -rf /tmp/buildbuddy-rbe-bridge
           echo "BuildBuddy bridge configuration removed."
 
+      - name: Compact inactive reproxy logs while retaining failures
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR=/tmp/rbe-test
+          test -d "$DIR" || exit 0
+          echo '=== BEFORE RBE LOG COMPACTION ==='
+          du -sh "$DIR" || true
+          # Do not mutate live reproxy logs, or consume active .rrpl during shutdown.
+          if pgrep -x reproxy >/dev/null 2>&1; then
+            echo '::warning::reproxy still running; skip compaction to protect metrics.'
+            exit 0
+          fi
+          python3 - "$DIR" "$RBE_INFO_KEEP_MIB" "$RBE_RRPL_KEEP_MIB" <<'PYCLEAN'
+          import pathlib,sys,os
+          root=pathlib.Path(sys.argv[1]); tail=int(sys.argv[2])*1024*1024
+          rrpl_limit=int(sys.argv[3])*1024*1024
+          summary=[]
+          for file in root.iterdir():
+              if not file.is_file() or file.is_symlink(): continue
+              name=file.name; size=file.stat().st_size
+              # Keep ERROR/WARNING/metrics and the last portion of huge INFO logs.
+              if (name.startswith(('reproxy.','bootstrap.','reproxy_')) and
+                  ('.INFO.' in name or name.endswith('.INFO')) and size > 2*tail):
+                  with file.open('rb') as src:
+                      src.seek(-tail,os.SEEK_END); data=src.read(tail)
+                  tmp=file.with_name(name+'.compact')
+                  tmp.write_bytes(data)
+                  os.replace(tmp,file)
+                  summary.append((name,size,len(data),'tail-kept'))
+              elif name.startswith('reproxy_') and name.endswith('.rrpl') and size>rrpl_limit:
+                  # Only discard oversized action logs once final metrics exist.
+                  if (root/'rbe_metrics.txt').is_file() and (root/'rbe_metrics.pb').is_file():
+                      file.unlink()
+                      summary.append((name,size,0,'removed-post-metrics'))
+          report=root/'rbe-log-compaction.tsv'
+          report.write_text('file\tbefore_bytes\tafter_bytes\tstatus\n'+''.join(
+              f'{name}\t{old}\t{new}\t{state}\n' for name,old,new,state in summary))
+          print(f'Compacted {len(summary)} files')
+          PYCLEAN
+          echo '=== AFTER RBE LOG COMPACTION ==='
+          du -sh "$DIR" || true
+          df -h /
+
       - name: Redact BuildBuddy API key from RBE artifacts
         if: always()
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          # Streaming, bounded-memory redaction. No read_bytes() of multi-GiB
+          # files, no secret in the workflow stdout or command line.
           python3 - <<'PYREDACT'
           import os
           from pathlib import Path
-
-          key = os.environ.get("BUILDBUDDY_API_KEY", "").encode()
-          root = Path("/tmp/rbe-test")
-          if key and root.is_dir():
-              for file in root.rglob("*"):
-                  if not file.is_file() or file.is_symlink():
-                      continue
-                  data = file.read_bytes()
-                  if key in data:
-                      # Preserve file length for binary diagnostic formats.
-                      file.write_bytes(data.replace(key, b"*" * len(key)))
-                      print(f"Redacted secret from: {file.relative_to(root)}")
+          key=os.environ.get('BUILDBUDDY_API_KEY','').encode()
+          root=Path('/tmp/rbe-test')
+          if not key or not root.is_dir(): raise SystemExit(0)
+          assert len(key)>0
+          chunk=1024*1024
+          for file in root.rglob('*'):
+              if not file.is_file() or file.is_symlink(): continue
+              temp=file.with_name(file.name+'.redacting')
+              dirty=False; remain=b''
+              try:
+                  with file.open('rb') as src, temp.open('wb') as dst:
+                      while True:
+                          block=src.read(chunk)
+                          if not block: break
+                          data=remain+block
+                          if key in data: dirty=True
+                          scrub=data.replace(key,b'*'*len(key))
+                          cut=max(0,len(scrub)-len(key)+1)
+                          dst.write(scrub[:cut]); remain=scrub[cut:]
+                      if key in remain: dirty=True
+                      dst.write(remain.replace(key,b'*'*len(key)))
+                  if dirty:
+                      os.chmod(temp,file.stat().st_mode)
+                      os.replace(temp,file)
+                      print('Redacted secret from:',file.relative_to(root))
+                  else: temp.unlink()
+              finally:
+                  if temp.exists(): temp.unlink()
           PYREDACT
 
       - name: Upload full ROM trial diagnostics
@@ -2765,7 +3070,7 @@ jobs:
         with:
           name: rbe-test-logs-${{ github.run_id }}
           path: |
-            /tmp/rbe-test
+            /home/runner/work/los/.rbe-diagnostics
             /home/runner/work/los/.repo/repo.log
           if-no-files-found: warn
           retention-days: 7
