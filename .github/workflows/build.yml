@@ -817,6 +817,27 @@ jobs:
             test -s "$DEST/$bin"
             test -x "$DEST/$bin" || chmod 0755 "$DEST/$bin"
           done
+          # P0.2: register Soong host tool after trimming the original project.
+          # ART run-test genrules use tools: ["rewrapper"] and need an Android.bp
+          # module, even when the standalone rewrapper executable exists.
+          # Restore ONLY this tiny module, not the multi-version project checkout.
+          RBE_BP="prebuilts/remoteexecution-client/Android.bp"
+          if [ -e "$RBE_BP" ]; then
+            echo "::error::Unexpected existing Android.bp: $RBE_BP; refusing to overwrite it."
+            exit 1
+          fi
+          cat > "$RBE_BP" <<EOFRBE_BP
+          // Lightweight Soong registration for the separately pinned AOSP reclient.
+          prebuilt_build_tool {
+              name: "rewrapper",
+              src: "compat-${PINNED_VERSION}/rewrapper",
+          }
+          EOFRBE_BP
+          test -s "$RBE_BP"
+          test -x "$DEST/rewrapper"
+          echo '=== SOONG REWRAPPER MODULE REGISTRATION ==='
+          cat "$RBE_BP" | tee /tmp/rbe-test/rewrapper-Android.bp.txt
+
           # The one-time shallow/sparse clone is no longer needed during build.
           rm -rf "$FETCH_DIR"
 
@@ -838,6 +859,9 @@ jobs:
             "$PINNED_COMMIT" "$PINNED_VERSION" \
             > /tmp/rbe-test/reclient-version.txt
           echo "RBE_DIR=$DEST" >> "$GITHUB_ENV"
+          # Soong remoteexec defaults to live/rewrapper, which we trimmed.
+          # Force the same pinned executable for C/C++ RBE actions.
+          echo "RBE_WRAPPER=$DEST/rewrapper" >> "$GITHUB_ENV"
           echo "=== RECLIENT VERSION ==="
           "$DEST/rewrapper" --version 2>&1 | tee -a /tmp/rbe-test/reclient-version.txt || true
           "$DEST/reproxy" --version 2>&1 | tee -a /tmp/rbe-test/reclient-version.txt || true
@@ -855,6 +879,13 @@ jobs:
           test -x "$RBE_DIR/reproxy"
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/bootstrap"
+          test -x "$RBE_WRAPPER"
+          test -s prebuilts/remoteexecution-client/Android.bp
+          grep -Eq '^[[:space:]]*name:[[:space:]]*"rewrapper"' \
+            prebuilts/remoteexecution-client/Android.bp
+          echo "RBE_WRAPPER=$RBE_WRAPPER"
+          echo '=== SOONG REWRAPPER MODULE ==='
+          cat prebuilts/remoteexecution-client/Android.bp
 
           echo "=== RBE DEPENDENCY SCANNER ==="
           if [ -f "$RBE_DIR/dependency_scanner_go_plugin.so" ]; then
@@ -1295,6 +1326,10 @@ jobs:
           RBE_REL_WORKDIR="$(realpath --relative-to="$RBE_exec_root" "$(pwd -P)")"
 
           mark_stage rbe-configuration
+          # Ensure Soong and ART both resolve the pinned rewrapper, not live/.
+          export RBE_WRAPPER="$RBE_DIR/rewrapper"
+          test -x "$RBE_WRAPPER"
+          test -s prebuilts/remoteexecution-client/Android.bp
           echo "=== RBE WORKING DIRECTORY COMPATIBILITY ==="
           echo "RBE_exec_root=$RBE_exec_root"
           echo "RBE_REL_WORKDIR=$RBE_REL_WORKDIR"
@@ -1316,6 +1351,7 @@ jobs:
             echo "RBE_service=${RBE_service}"
             echo "RBE_service_no_security=${RBE_service_no_security}"
             echo "RBE_DIR=${RBE_DIR}"
+            echo "RBE_WRAPPER=${RBE_WRAPPER}"
             echo "RBE_exec_root=${RBE_exec_root}"
             echo "RBE_relative_working_dir=${RBE_REL_WORKDIR}"
             echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
