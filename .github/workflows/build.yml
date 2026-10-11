@@ -63,6 +63,16 @@ jobs:
       SOONG_GOMEMLIMIT: "6GiB"
       # Limit active Go workers during the memory-heavy graph generation only.
       SOONG_GRAPH_GOMAXPROCS: "2"
+      # Diagnostic trial: trace Go GC during Soong graph only (not bacon).
+      # Raw traces are in m-nothing.log; a compact tail is also extracted.
+      SOONG_GRAPH_GC_TRACE: "1"
+      SOONG_GRAPH_GC_TAIL_LINES: "200"
+      # Stop before RAM and disk swap are both exhausted. This protects the
+      # GitHub runner and preserves logs, but DOES NOT solve graph memory use.
+      GRAPH_MEM_GUARD_ENABLED: "1"
+      GRAPH_MEM_GUARD_RAM_MIB: "1024"
+      GRAPH_MEM_GUARD_SWAP_MIB: "1536"
+      GRAPH_MEM_GUARD_SAMPLES: "3"
       # Hybrid graph memory: compressed RAM swap first, disk swap second.
       # ZRAM is best-effort: GitHub runner kernels may not provide the module.
       SOONG_ZRAM_GIB: "8"
@@ -1494,7 +1504,8 @@ jobs:
                 grep -E '^(Name|State|VmRSS|VmHWM|VmSwap|VmSize|Threads):' \
                   "/proc/$pid/status" 2>/dev/null || true
                 if [ -r "/proc/$pid/smaps_rollup" ]; then
-                  grep -E '^(Rss|Pss|Swap|Private_Dirty):' \
+                  # smaps_rollup may stall heavily when disk swap is saturated.
+                  timeout 3s grep -E '^(Rss|Pss|Swap|Private_Dirty):' \
                     "/proc/$pid/smaps_rollup" 2>/dev/null || true
                 fi
               done < <(pgrep -x soong_build 2>/dev/null || true)
@@ -1540,6 +1551,31 @@ jobs:
               "$(cgroup_event_value oom)" "$(cgroup_event_value oom_kill)" \
               >> "$SOONG_MEMORY_TSV"
           }
+          # PID-level CPU information, not the wrapper bash process CPU.
+          # %CPU is procps' lifetime-average, not an instantaneous sample.
+          SOONG_PROCESS_TSV=/tmp/rbe-test/soong-process-samples.tsv
+          printf 'timestamp\tphase\tpid\tppid\tpcpu_pct\tpmem_pct\trss_kib\tvsz_kib\telapsed_seconds\tstat\tcomm\n' \
+            > "$SOONG_PROCESS_TSV"
+          sample_soong_processes() {
+            local phase="$1" pid timestamp
+            timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            while IFS= read -r pid; do
+              [ -r "/proc/$pid/status" ] || continue
+              ps -p "$pid" -o pid=,ppid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm= \
+                2>/dev/null | awk -v t="$timestamp" -v p="$phase" \
+                  'NF>=9 {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",t,p,$1,$2,$3,$4,$5,$6,$7,$8,$9}' \
+                  >> "$SOONG_PROCESS_TSV" || true
+            done < <(pgrep -x soong_build 2>/dev/null || true)
+          }
+          # Main build log already includes all GC traces (potentially multiple
+          # Go processes). Keep a small extract for quick post-mortem analysis.
+          SOONG_GC_TAIL=/tmp/rbe-test/soong-gc-trace-tail.log
+          extract_soong_gc_tail() {
+            local log_file="$1"
+            [ -s "$log_file" ] || return 0
+            grep -aE '(^|[[:space:]])gc [0-9]+ @' "$log_file" \
+              | tail -n "$SOONG_GRAPH_GC_TAIL_LINES" > "$SOONG_GC_TAIL" || true
+          }
           : > /tmp/rbe-test/memory-pressure.log
           if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$CGROUP_MEMORY_DIR/memory.events" ]; then
             cp "$CGROUP_MEMORY_DIR/memory.events" \
@@ -1547,16 +1583,19 @@ jobs:
           fi
           record_memory_pressure pre-graph
           sample_soong_memory pre-graph
+          sample_soong_processes pre-graph
 
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
           # compiler errors; an external SIGTERM is separately captured above.
           run_monitored_m() {
             local phase="$1" target="$2" log_file="$3" status_file="$4"
-            local disk_trip="$5" time_trip="$6"
+            local disk_trip="$5" time_trip="$6" memory_trip="${7:-}"
             local available now free_gib mem_kib seconds_left last_write idle_secs
             local line wait_rc warned=0 idle_warned=0 tick sample_counter=0
+            local guard_consecutive=0
             rm -f "$status_file" "$disk_trip" "$time_trip"
+            if [ -n "$memory_trip" ]; then rm -f -- "$memory_trip"; fi
             (
               # Avoid trap messages being written into Soong's stdout.
               trap - ERR TERM INT
@@ -1564,10 +1603,14 @@ jobs:
               set -o pipefail
               if [ "$phase" = build-graph ]; then
                 export GOMAXPROCS="$SOONG_GRAPH_GOMAXPROCS"
-                echo "=== SOONG GRAPH GO RUNTIME: GOGC=$GOGC GOMAXPROCS=$GOMAXPROCS GOMEMLIMIT=${GOMEMLIMIT:-not-supported} ==="
+                if [ "$SOONG_GRAPH_GC_TRACE" = 1 ]; then
+                  # Inherited by Soong's Go processes; not enabled for bacon.
+                  export GODEBUG="${GODEBUG:+${GODEBUG},}gctrace=1"
+                fi
+                echo "=== SOONG GRAPH GO RUNTIME: GOGC=$GOGC GOMAXPROCS=$GOMAXPROCS GOMEMLIMIT=${GOMEMLIMIT:-not-supported} GC_TRACE=$SOONG_GRAPH_GC_TRACE ==="
               else
-                # Only graph generation uses the reduced Go CPU parallelism.
-                unset GOMAXPROCS || true
+                # Graph-specific profiling must not slow down full ROM compile.
+                unset GOMAXPROCS GODEBUG || true
               fi
               m -j2 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
@@ -1592,8 +1635,19 @@ jobs:
                 inner_now="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
                 line="$line host_free_gib=$((root_now / 1073741824)) btrfs_free_gib=$((inner_now / 1073741824))"
               fi
+              # Three consecutive low-resource samples, not a single dip.
+              if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ]; then
+                if (( mem_kib <= GRAPH_MEM_GUARD_RAM_MIB * 1024 && \
+                      swap_free_kib <= GRAPH_MEM_GUARD_SWAP_MIB * 1024 )); then
+                  guard_consecutive=$((guard_consecutive + 1))
+                else
+                  guard_consecutive=0
+                fi
+                line="$line memory_guard_hits=${guard_consecutive}/${GRAPH_MEM_GUARD_SAMPLES}"
+              fi
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
               sample_soong_memory "$phase"
+              sample_soong_processes "$phase"
               # Live Actions log survives more cancellation scenarios than
               # artifact upload. No arguments/credentials are printed.
               if [ "$phase" = build-graph ]; then
@@ -1626,12 +1680,32 @@ jobs:
                     > /tmp/rbe-test/soong-build-binary-go-version.txt 2>&1 || true
                 fi
               fi
-              # Deep samples every 30s or every 10s when RAM is under 4GiB.
-              if (( sample_counter % 3 == 0 || mem_kib < 4194304 )); then
+              # smaps_rollup can provoke I/O thrashing when swap is full;
+              # capture deep reports every ~60s, while lightweight samples
+              # remain every ~10s and the guard captures one final snapshot.
+              if (( sample_counter % 6 == 0 )); then
                 record_memory_pressure "$phase"
               fi
               sample_counter=$((sample_counter + 1))
 
+              if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ] \
+                 && (( guard_consecutive >= GRAPH_MEM_GUARD_SAMPLES )); then
+                {
+                  echo "Soong memory safety stop: RAM available <= ${GRAPH_MEM_GUARD_RAM_MIB} MiB and swap free <= ${GRAPH_MEM_GUARD_SWAP_MIB} MiB"
+                  echo "consecutive_samples=$guard_consecutive timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                  echo "mem_available_kib=$mem_kib swap_free_kib=$swap_free_kib"
+                  echo "cgroup_memory_current=$(cgroup_read memory.current)"
+                  echo "cgroup_swap_current=$(cgroup_read memory.swap.current)"
+                  echo "cgroup_oom_kill=$(cgroup_event_value oom_kill)"
+                  echo '--- SOONG PID / CPU / RSS / VSZ ---'
+                  tail -n 12 "$SOONG_PROCESS_TSV" || true
+                } | tee "$memory_trip"
+                extract_soong_gc_tail "$log_file"
+                record_memory_pressure "graph-memory-guard-trip"
+                echo "::error::Soong graph stopped proactively to preserve runner and diagnostics (exit 72)."
+                stop_process_tree "$BUILD_PID"
+                break
+              fi
               if (( available < DISK_STOP_GIB * 1073741824 )); then
                 echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
                 echo "::error::Insufficient disk in $phase; terminating children."
@@ -1667,8 +1741,11 @@ jobs:
             if [ -s "$status_file" ]; then MONITORED_RC="$(cat "$status_file")"; fi
             if [ -s "$disk_trip" ]; then MONITORED_RC=70; fi
             if [ -s "$time_trip" ]; then MONITORED_RC=71; fi
+            if [ -n "$memory_trip" ] && [ -s "$memory_trip" ]; then MONITORED_RC=72; fi
             disk_sample "post-$phase" >/dev/null
             sample_soong_memory "post-$phase exit=$MONITORED_RC"
+            sample_soong_processes "post-$phase exit=$MONITORED_RC"
+            if [ "$phase" = build-graph ]; then extract_soong_gc_tail "$log_file"; fi
             record_memory_pressure "post-$phase exit=$MONITORED_RC"
             echo "=== $phase EXIT: $MONITORED_RC ==="
           }
@@ -1685,7 +1762,8 @@ jobs:
             /tmp/rbe-test/m-nothing.log \
             /tmp/rbe-test/graph-exit-code.txt \
             /tmp/rbe-test/graph-disk-stop-triggered.txt \
-            /tmp/rbe-test/graph-time-stop-triggered.txt
+            /tmp/rbe-test/graph-time-stop-triggered.txt \
+            /tmp/rbe-test/graph-memory-stop-triggered.txt
           if [ "$MONITORED_RC" -ne 0 ]; then
             echo '=== BUILD GRAPH LOG TAIL ==='
             tail -n 180 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
@@ -1931,7 +2009,8 @@ jobs:
               tail -n 15 /tmp/rbe-test/webview-lfs-check.log
               echo '```'
             fi
-            echo "Soong: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}."
+            echo "Soong: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}; gctrace=${SOONG_GRAPH_GC_TRACE}."
+            echo "Graph memory guard: enabled=${GRAPH_MEM_GUARD_ENABLED}, RAM<=${GRAPH_MEM_GUARD_RAM_MIB} MiB AND swap<=${GRAPH_MEM_GUARD_SWAP_MIB} MiB for ${GRAPH_MEM_GUARD_SAMPLES} consecutive samples."
             echo "Hybrid swap requested: ZRAM=${SOONG_ZRAM_GIB}GiB logical; disk=${SOONG_DISK_SWAP_GIB}GiB (post-graph base ${POST_GRAPH_DISK_SWAP_GIB}GiB)."
             echo '### Soong Go/runtime verification'
             if [ -s /tmp/rbe-test/soong-go-runtime.txt ]; then
@@ -1954,6 +2033,24 @@ jobs:
                 printf "Peak sampled soong_build RSS: **%.2f GiB**; VmSwap: **%.2f GiB**; lowest available RAM: **%.2f GiB**.\n", maxrss/1048576, maxswap/1048576, minram/1048576;
                 printf "Maximum sampled cgroup oom_kill counter: **%d** (check baseline for changes).\n", maxkill
               }' /tmp/rbe-test/soong-memory-samples.tsv
+            fi
+            if [ -s /tmp/rbe-test/graph-memory-stop-triggered.txt ]; then
+              echo '**Soong graph proactively stopped due to sustained low RAM AND low swap.**'
+              echo '```text'
+              cat /tmp/rbe-test/graph-memory-stop-triggered.txt
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/soong-gc-trace-tail.log ]; then
+              echo '### Last Go GC traces from graph (may include multiple Go processes)'
+              echo '```text'
+              tail -n 12 /tmp/rbe-test/soong-gc-trace-tail.log
+              echo '```'
+            fi
+            if [ -s /tmp/rbe-test/soong-process-samples.tsv ]; then
+              echo '### Recent Soong PID / CPU / RSS samples'
+              echo '```text'
+              tail -n 8 /tmp/rbe-test/soong-process-samples.tsv
+              echo '```'
             fi
             for status in /tmp/rbe-test/zram-status.txt /tmp/rbe-test/swap-status.txt /tmp/rbe-test/graph-swap-reclaim.txt; do
               if [ -s "$status" ]; then
@@ -2183,6 +2280,12 @@ jobs:
           cat /tmp/rbe-test/soong-build-binary-go-version.txt 2>/dev/null || true
           echo '=== SOONG MEMORY SAMPLES TAIL ==='
           tail -n 30 /tmp/rbe-test/soong-memory-samples.tsv 2>/dev/null || true
+          echo '=== SOONG PROCESS PID / CPU / RSS SAMPLES TAIL ==='
+          tail -n 30 /tmp/rbe-test/soong-process-samples.tsv 2>/dev/null || true
+          echo '=== GRAPH GC TRACE RECENT LINES ==='
+          tail -n 30 /tmp/rbe-test/soong-gc-trace-tail.log 2>/dev/null || true
+          echo '=== GRAPH MEMORY GUARD DETAIL ==='
+          cat /tmp/rbe-test/graph-memory-stop-triggered.txt 2>/dev/null || true
           echo '=== CGROUP OOM EVENT BASELINE ==='
           cat /tmp/rbe-test/cgroup-memory-events-before-graph.txt 2>/dev/null || true
           echo '=== P1 STORAGE TRIM SUMMARY ==='
