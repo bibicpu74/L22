@@ -34,7 +34,8 @@ jobs:
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote"
 
-      # The legacy reclient used by this pipeline cannot attach RBE_remote_headers.
+      # Keep authenticated TLS via the existing loopback bridge; preserve the
+      # BuildBuddy API key outside the uploaded diagnostic directory.
       # Forward plaintext h2c on loopback to a TLS-verified nginx gRPC proxy
       # which attaches BuildBuddy's x-buildbuddy-api-key header.
       RBE_service: "127.0.0.1:19099"
@@ -42,6 +43,9 @@ jobs:
       RBE_service_no_auth: "true"
       RBE_use_application_default_credentials: "false"
       RBE_use_rpc_credentials: "false"
+      # Reclient 0.172 uses the matching standalone C/C++ dependency scanner.
+      # execrel:// resolves scandeps_server next to the pinned reproxy binary.
+      RBE_depsscanner_address: "execrel://"
 
       # Keep all RBE diagnostics in one place.
       RBE_log_dir: "/tmp/rbe-test"
@@ -736,9 +740,8 @@ jobs:
           fi
           echo '=== LINEAGEOS 21.0 AP2A RELEASE CONFIG VERIFIED ==='
 
-      # Reclient 0.25 (2021) predates the Remote Execution API fix for
-      # working-directory-relative output paths (SDK fix Nov 2021).
-      # Pin a coherent prebuilt release rather than mixing rewrapper/reproxy.
+      # AOSP reclient 0.172 with matching scandeps_server, pinned to one commit.
+      # Keep repo-sync trim: only the single known-good live snapshot is fetched.
       # Ubuntu 24.04 ships ncurses6; legacy RenderScript Clang needs ncurses5.
       # Use the matching Jammy security packages, pinned with checksums from
       # packages.ubuntu.com, instead of making unsafe SONAME symlinks.
@@ -899,14 +902,17 @@ jobs:
           "$CLANG" --version
           echo '=== LEGACY RENDERSCRIPT CLANG PREFLIGHT PASSED ==='
 
-      - name: Install compatible reclient 0.57.0 (pinned AOSP)
+      - name: Install pinned AOSP reclient 0.172 with matching Clang scanner
         working-directory: /home/runner/work/los
         timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
-          PINNED_COMMIT="5148d33653fe6920633e405fd990b525f5bce912"
-          PINNED_VERSION="0.57.0.4865132"
+          # AOSP platform/prebuilts/remoteexecution-client, 2025-03-07.
+          # This commit's live/ snapshot is version 0.172.0.3cf60ba5.
+          PINNED_COMMIT="943a1532c17256a37eb6d90cdba450ff761b36d1"
+          PINNED_VERSION="0.172.0.3cf60ba5"
+          PINNED_TREE="live"
           DEST="prebuilts/remoteexecution-client/compat-${PINNED_VERSION}"
           FETCH_DIR="$RUNNER_TEMP/reclient-pinned"
 
@@ -915,22 +921,32 @@ jobs:
           git -C "$FETCH_DIR" remote add origin \
             https://android.googlesource.com/platform/prebuilts/remoteexecution-client
           git -C "$FETCH_DIR" config core.sparseCheckout true
-          printf '%s\n' "/${PINNED_VERSION}/" > "$FETCH_DIR/.git/info/sparse-checkout"
+          printf '%s\n' "/${PINNED_TREE}/" > "$FETCH_DIR/.git/info/sparse-checkout"
           echo "=== FETCH PINNED RECLIENT ==="
           git -C "$FETCH_DIR" -c protocol.version=2 fetch --depth=1 \
             --filter=blob:none origin "$PINNED_COMMIT"
           git -C "$FETCH_DIR" checkout -q --detach FETCH_HEAD
           test "$(git -C "$FETCH_DIR" rev-parse HEAD)" = "$PINNED_COMMIT"
 
-          # Use one coherent pinned release, without any fallback into a
-          # repo-synced "live" tree. Copying the whole pinned directory also
-          # keeps dependency scanner libraries and symlinks from this release.
-          test -d "$FETCH_DIR/$PINNED_VERSION"
-          cp -a "$FETCH_DIR/$PINNED_VERSION/." "$DEST/"
-          for bin in rewrapper reproxy bootstrap; do
-            test -s "$DEST/$bin"
+          # Do not use a moving "live" name at runtime. Copy this commit's
+          # immutable live/ snapshot into a version-specific standalone path.
+          test -d "$FETCH_DIR/$PINNED_TREE"
+          test -s "$FETCH_DIR/$PINNED_TREE/version.txt"
+          actual_version="$(tr -d '\r\n' < "$FETCH_DIR/$PINNED_TREE/version.txt")"
+          if [ "$actual_version" != "$PINNED_VERSION" ]; then
+            echo "::error::Pinned AOSP snapshot version mismatch: $actual_version"
+            exit 1
+          fi
+          cp -a "$FETCH_DIR/$PINNED_TREE/." "$DEST/"
+          for bin in rewrapper reproxy bootstrap scandeps_server; do
+            test -s "$DEST/$bin" || { echo "::error::Missing reclient component: $bin"; exit 1; }
             test -x "$DEST/$bin" || chmod 0755 "$DEST/$bin"
           done
+          test "$(tr -d '\r\n' < "$DEST/version.txt")" = "$PINNED_VERSION"
+          # Record hashes for reproducibility without embedding opaque binary
+          # checksums tied to a different AOSP revision.
+          ( cd "$DEST" && sha256sum rewrapper reproxy bootstrap scandeps_server version.txt ) \
+            | tee /tmp/rbe-test/reclient-sha256.txt
           # P0.2: register Soong host tool after trimming the original project.
           # ART run-test genrules use tools: ["rewrapper"] and need an Android.bp
           # module, even when the standalone rewrapper executable exists.
@@ -969,8 +985,8 @@ jobs:
             "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" \
             >> /tmp/rbe-test/resource-samples.tsv
 
-          printf 'pinned_commit=%s\npinned_version=%s\n' \
-            "$PINNED_COMMIT" "$PINNED_VERSION" \
+          printf 'pinned_commit=%s\npinned_version=%s\npinned_source_tree=%s\ndepsscanner_address=execrel://\n' \
+            "$PINNED_COMMIT" "$PINNED_VERSION" "$PINNED_TREE" \
             > /tmp/rbe-test/reclient-version.txt
           echo "RBE_DIR=$DEST" >> "$GITHUB_ENV"
           # Soong remoteexec defaults to live/rewrapper, which we trimmed.
@@ -1001,17 +1017,41 @@ jobs:
           echo '=== SOONG REWRAPPER MODULE ==='
           cat prebuilts/remoteexecution-client/Android.bp
 
-          echo "=== RBE DEPENDENCY SCANNER ==="
-          if [ -f "$RBE_DIR/dependency_scanner_go_plugin.so" ]; then
-            echo "dependency_scanner_go_plugin.so found."
-          else
-            echo "::warning::dependency_scanner_go_plugin.so not found in $RBE_DIR."
+          echo "=== PINNED RBE SCANNER: REQUIRED ==="
+          test -x "$RBE_DIR/scandeps_server"
+          test -s "$RBE_DIR/version.txt"
+          test "$(tr -d '\r\n' < "$RBE_DIR/version.txt")" = '0.172.0.3cf60ba5'
+          test "${RBE_depsscanner_address:-}" = 'execrel://'
+          echo "scanner=$RBE_DIR/scandeps_server"
+          echo "scanner_address=$RBE_depsscanner_address"
+          # Standalone scanner may be a static binary (ldd exits nonzero);
+          # missing shared libraries remain a hard failure.
+          ( ldd "$RBE_DIR/scandeps_server" 2>&1 || true ) \
+            | tee /tmp/rbe-test/reclient-scanner-ldd.txt
+          if grep -q 'not found' /tmp/rbe-test/reclient-scanner-ldd.txt; then
+            echo '::error::Standalone Clang dependency scanner has missing shared libraries.'
+            exit 1
           fi
-          if [ -x "$RBE_DIR/scandeps_server" ]; then
-            echo "scandeps_server found."
-          else
-            echo "::notice::scandeps_server not found (may be absent in older reclient builds)."
-          fi
+          echo "=== CLANG 18 FLAG COMPATIBILITY PREFLIGHT ==="
+          CLANG_CPP=prebuilts/clang/host/linux-x86/clang-r510928/bin/clang++
+          test -x "$CLANG_CPP"
+          {
+            "$CLANG_CPP" --version
+            printf 'int main() { int x = 0; return x; }\n' \
+              | "$CLANG_CPP" -x c++ -std=c++17 -g -gz=zstd \
+                  -ftrivial-auto-var-init=zero -c - \
+                  -o /tmp/rbe-test/clang18-flags-preflight.o
+            test -s /tmp/rbe-test/clang18-flags-preflight.o
+            stat -c 'clang_smoke_object_bytes=%s' \
+              /tmp/rbe-test/clang18-flags-preflight.o
+          } > /tmp/rbe-test/clang18-flags-preflight.log 2>&1 || {
+            cat /tmp/rbe-test/clang18-flags-preflight.log
+            echo '::error::Checked-out Clang toolchain did not accept required flags.'
+            exit 1
+          }
+          cat /tmp/rbe-test/clang18-flags-preflight.log
+          # The real remote dependency-scanner proof follows after graph
+          # generation in the existing remote-only libbase smoke stage.
 
           echo "=== REPROXY VERSION ==="
           "$RBE_DIR/reproxy" --version || true
@@ -1463,6 +1503,7 @@ jobs:
           {
             echo "USE_RBE=${USE_RBE}"
             echo "RBE_service=${RBE_service}"
+            echo "RBE_depsscanner_address=${RBE_depsscanner_address}"
             echo "RBE_service_no_security=${RBE_service_no_security}"
             echo "RBE_DIR=${RBE_DIR}"
             echo "RBE_WRAPPER=${RBE_WRAPPER}"
@@ -2192,6 +2233,7 @@ jobs:
           cat /tmp/rbe-test/reclient-version.txt
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/reproxy"
+          test -x "$RBE_DIR/scandeps_server"
           # Explicitly refuse local fallback for the proof run.
           if [ "${RBE_CXX_EXEC_STRATEGY:-}" != remote ]; then
             echo '::error::Remote-only C/C++ strategy is required for this trial.'
@@ -2210,8 +2252,19 @@ jobs:
             /tmp/rbe-test/rbe-libbase-disk-stop-triggered.txt \
             /tmp/rbe-test/rbe-libbase-time-stop-triggered.txt
           if [ "$MONITORED_RC" -ne 0 ]; then
+            echo '=== STANDALONE CLANG SCANNER / RBE FAILURE SIGNATURES ==='
+            {
+              echo "reclient_version=$(tr -d '\r\n' < "$RBE_DIR/version.txt")"
+              echo "depsscanner_address=${RBE_depsscanner_address}"
+              grep -anE -m 80 \
+                'ClangScanDeps|scandeps_server|processing inputs failed|failed to get dependencies|unsupported argument|ftrivial-auto-var-init|LOCAL_ERROR|UNAUTHENTICATED|PERMISSION_DENIED|UNAVAILABLE|DeadlineExceeded' \
+                /tmp/rbe-test/rbe-libbase-smoke.log \
+                /tmp/rbe-test/reproxy.INFO /tmp/rbe-test/reproxy.ERROR 2>/dev/null \
+                | cut -c 1-400 || true
+            } > /tmp/rbe-test/rbe-scanner-smoke-diagnostics.txt
+            tail -n 100 /tmp/rbe-test/rbe-scanner-smoke-diagnostics.txt || true
             tail -n 180 /tmp/rbe-test/rbe-libbase-smoke.log || true
-            echo "::error::libbase remote compilation failed (exit $MONITORED_RC)."
+            echo "::error::libbase remote compilation failed (exit $MONITORED_RC); see scanner diagnostics."
             exit "$MONITORED_RC"
           fi
           # Confirm one .o actually produced by this libbase smoke is also a
@@ -2228,6 +2281,8 @@ jobs:
             echo "compiled_object=$RBE_SAMPLE_TARGET"
             echo "compiled_object_bytes=$(stat -c %s "$RBE_SAMPLE_TARGET")"
             echo 'cxx_execution_strategy=remote'
+            echo "reclient_version=$(tr -d '\r\n' < "$RBE_DIR/version.txt")"
+            echo "depsscanner_address=${RBE_depsscanner_address}"
             echo 'expanded_cxx_command_uses_rewrapper=true'
             echo 'libbase_build_exit_code=0'
             echo 'note=Successful remote-only libbase smoke and on-disk C++ object with matching expanded rewrapper command. Server-side BuildBuddy metrics not independently queried.'
