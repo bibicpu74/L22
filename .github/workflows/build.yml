@@ -1,4 +1,4 @@
-name: LineageOS 21.0 - star2lte Btrfs ZSTD + RBE16 + LFS
+name: LineageOS 21.0 - star2lte Btrfs ZSTD + RBE16 + JAR dedupe pilot
 
 on:
   workflow_dispatch:
@@ -37,6 +37,15 @@ on:
           - '16'
           - '20'
           - '24'
+      jar_dedupe_mode:
+        description: "Soong JAR dedupe: adaptive guarded pilot, probe-only, or disabled"
+        type: choice
+        required: true
+        default: adaptive
+        options:
+          - adaptive
+          - probe
+          - off
 
 permissions:
   contents: read
@@ -60,6 +69,14 @@ jobs:
       BTRFS_ZSTD_LEVEL: "${{ inputs.btrfs_zstd_level || '1' }}"
       SOONG_PROFILE_INTERVAL_SAMPLES: "360"  # 10s monitor x 360 = about 60 minutes
       SOONG_PROFILE_TIMEOUT_SECONDS: "80"
+      # Conservative Btrfs-only pilot on stable byte-identical Java JARs.
+      # Duperemove preserves paths and file contents; never delete intermediates.
+      JAR_DEDUPE_MODE: "${{ inputs.jar_dedupe_mode || 'adaptive' }}"
+      JAR_DEDUPE_INTERVAL_SAMPLES: "180"  # about every 30 minutes
+      JAR_DEDUPE_AGE_MINUTES: "20"
+      JAR_DEDUPE_HASH_GIB: "3"          # 6GiB only if pilot demonstrably recovered >=64MiB
+      JAR_DEDUPE_MAX_FILES: "350"
+      JAR_DEDUPE_MIN_FREE_GIB: "9"
 
       # Android / Soong RBE
       USE_RBE: "1"
@@ -233,6 +250,12 @@ jobs:
             ca-certificates \
             openssl \
             unzip
+
+          # Optional storage experiment must not block the ROM toolchain.
+          if ! command -v duperemove >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y duperemove \
+              || echo '::warning::duperemove unavailable; JAR scan remains read-only.'
+          fi
 
           mkdir -p "$HOME/bin"
           curl -fsSL \
@@ -1028,6 +1051,213 @@ jobs:
           PYPROFILE
           python3 -m py_compile /tmp/rbe-test/soong_storage_probe.py
           echo 'SOONG_STORAGE_PROFILER_READY'
+
+      - name: Install guarded Soong JAR dedupe analyzer
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$JAR_DEDUPE_MODE" in off|probe|adaptive) ;; *) exit 1 ;; esac
+          if [ "$JAR_DEDUPE_MODE" = adaptive ] && [ "$WORKSPACE_STORAGE" != btrfs_zstd ]; then
+            echo '::notice::Plain workspace selected; apply mode will automatically use read-only scan.'
+          fi
+          # This is a SHA-256 exact-file pilot, not global block-level dedupe.
+          # No files are removed, renamed, modified, or reflink-replaced.
+          cat > /tmp/rbe-test/ci_jar_dedupe.py <<'PY_JAR_DEDUPE'
+          #!/usr/bin/env python3
+          """Bounded, conservative CI probe/dedupe for byte-identical stable Soong JARs.
+          No deletes, no file replacement, and no fstrim on root.  Conservative pilots only.
+          """
+          import argparse
+          import collections
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import zipfile
+          
+          GIB=1<<30
+          MIB=1<<20
+          
+          def physical(path):
+              try:
+                  st=os.stat(path)
+                  return st.st_blocks*512
+              except OSError:
+                  return -1
+          
+          def host_free():
+              st=os.statvfs('/')
+              return st.f_bavail*st.f_frsize
+          
+          def timestamp():
+              return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          
+          def write_tsv(path, header, rows):
+              with path.open('w') as f:
+                  f.write('\t'.join(header)+'\n')
+                  for row in rows:
+                      f.write('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in row)+'\n')
+          
+          def census(root, min_bytes, max_bytes, stable_age):
+              now=time.time()
+              by_size=collections.defaultdict(list)
+              total=0; count=0; stable_total=0; stable_count=0
+              inode_seen=set()
+              for base, dirs, files in os.walk(root,followlinks=False):
+                  for name in files:
+                      if not name.endswith('.jar'):continue
+                      path=Path(base)/name
+                      try:
+                          st=path.lstat()
+                          if not path.is_file() or path.is_symlink():continue
+                      except OSError: continue
+                      total+=st.st_size; count+=1
+                      if st.st_size < min_bytes or st.st_size > max_bytes:continue
+                      if now-st.st_mtime < stable_age:continue
+                      identity=(st.st_dev,st.st_ino)
+                      if identity in inode_seen:continue
+                      inode_seen.add(identity)
+                      stable_total+=st.st_size; stable_count+=1
+                      by_size[st.st_size].append((path,st))
+              return by_size, (total,count,stable_total,stable_count)
+          
+          def sha256_checked(path, old):
+              h=hashlib.sha256()
+              try:
+                  with path.open('rb') as f:
+                      first=os.fstat(f.fileno())
+                      if (first.st_size,first.st_mtime_ns,first.st_ino)!=(old.st_size,old.st_mtime_ns,old.st_ino): return None
+                      while True:
+                          buf=f.read(MIB)
+                          if not buf:break
+                          h.update(buf)
+                      last=os.fstat(f.fileno())
+                      if (last.st_size,last.st_mtime_ns,last.st_ino)!=(old.st_size,old.st_mtime_ns,old.st_ino): return None
+                  return h.hexdigest()
+              except (OSError,ValueError): return None
+          
+          def main():
+              p=argparse.ArgumentParser()
+              p.add_argument('--root',type=Path,required=True)
+              p.add_argument('--diagnostics',type=Path,required=True)
+              p.add_argument('--mode',choices=['off','probe','adaptive'],required=True)
+              p.add_argument('--age-minutes',type=int,default=20)
+              p.add_argument('--hash-gib',type=float,default=3)
+              p.add_argument('--max-files',type=int,default=350)
+              p.add_argument('--zip-samples',type=int,default=40)
+              p.add_argument('--backing',type=Path,default=Path('/tmp/los20-workspace-btrfs.img'))
+              p.add_argument('--min-host-gib',type=float,default=9)
+              a=p.parse_args()
+              out=a.diagnostics;out.mkdir(parents=True,exist_ok=True)
+              state_path=out/'jar-dedupe-state.json'
+              summary_file=out/'jar-dedupe-runs.tsv'
+              if not summary_file.exists():
+                  summary_file.write_text('timestamp\tmode\tfs\tjar_count\tjar_total_bytes\tstable_count\tsame_size_candidate_upper_bytes\tsha_hashed_bytes\tsha_hashed_files\tverified_duplicate_files\tverified_duplicate_bytes\tselected_for_dedupe_bytes\tduperemove_rc\thost_free_before\thost_free_after\tbacking_blocks_before\tbacking_blocks_after\tnote\n')
+              if a.mode=='off':return 0
+              if not a.root.is_dir():
+                  print('JAR_DEDUPE_SKIP: no Soong intermediates');return 0
+              fs=subprocess.run(['stat','-f','-c','%T',str(a.root)],capture_output=True,text=True,check=False).stdout.strip()
+              state={}
+              if state_path.exists():
+                  try:state=json.loads(state_path.read_text())
+                  except (ValueError,OSError):pass
+              promoted=bool(state.get('promoted'))
+              byte_budget=int(a.hash_gib*GIB*(2 if promoted else 1))
+              before=host_free(); backing_before=physical(a.backing)
+              by_size, (total,count,stable_total,stable_count)=census(a.root,128*1024,128*MIB,a.age_minutes*60)
+              groups=[(size,entries) for size,entries in by_size.items() if len(entries)>1]
+              candidates=sum(size*(len(entries)-1) for size,entries in groups)
+              # Prioritize maximum possible savings per candidate reading cost.
+              groups.sort(key=lambda g:(g[0]*(len(g[1])-1),g[0]),reverse=True)
+              inventory=[(size,len(entries),size*(len(entries)-1)) for size,entries in groups]
+              write_tsv(out/'jar-same-size-groups.tsv',('jar_size','files','unverified_upper_bound_bytes'),inventory[:200])
+              hashed=0; hashed_count=0
+              verified=[]
+              duplicate_bytes=0; duplicate_files=0
+              for size, entries in groups:
+                  if hashed+len(entries)*size>byte_budget or hashed_count+len(entries)>a.max_files:
+                      continue
+                  digests=collections.defaultdict(list)
+                  for path,st in entries:
+                      digest=sha256_checked(path,st)
+                      if digest is not None:digests[digest].append((path,st))
+                      hashed+=size;hashed_count+=1
+                  for digest,same in digests.items():
+                      if len(same)<2:continue
+                      verified.append((size,digest,same))
+                      duplicate_files+=len(same)-1
+                      duplicate_bytes+=size*(len(same)-1)
+              write_tsv(out/'jar-sha256-duplicates.tsv',('sha256','file_bytes','group_files','logical_duplicate_bytes','paths'),
+                        [(d,size,len(same),size*(len(same)-1),' ; '.join(str(x[0].relative_to(a.root)) for x in same)) for size,d,same in verified[:200]])
+              zip_rows=[]
+              sample_paths=[]
+              for size, entries in sorted(by_size.items(),reverse=True):
+                  for path,st in entries:
+                      sample_paths.append((size,path))
+                      if len(sample_paths)>=a.zip_samples:break
+                  if len(sample_paths)>=a.zip_samples:break
+              for size,path in sample_paths:
+                  try:
+                      with zipfile.ZipFile(path) as z:
+                          entries=z.infolist()
+                          stored=sum(x.file_size for x in entries if x.compress_type==zipfile.ZIP_STORED)
+                          compressed=sum(x.compress_size for x in entries if x.compress_type!=zipfile.ZIP_STORED)
+                          methods=','.join(map(str,sorted(set(x.compress_type for x in entries))))
+                          zip_rows.append((path.relative_to(a.root),size,len(entries),stored,compressed,methods))
+                  except (OSError,zipfile.BadZipFile,ValueError):pass
+              write_tsv(out/'jar-zip-structure.tsv',('jar','jar_bytes','entries','stored_entry_bytes','compressed_entry_bytes','methods'),zip_rows)
+              rc='skip'; selected_bytes=0;note='read_only'
+              if a.mode=='adaptive':
+                  if fs!='btrfs':note='not_btrfs'
+                  elif not shutil.which('duperemove'):note='duperemove_not_installed'
+                  elif before<a.min_host_gib*GIB:note='low_host_space_skip_io'
+                  elif not verified:note='no_verified_identical_jars_in_sample'
+                  else:
+                      # Never run against files changed during hashing or young outputs.
+                      chosen=[]
+                      for size,digest,files in verified:
+                          unchanged=[]
+                          for path,st in files:
+                              try:
+                                  curr=path.stat()
+                                  if (curr.st_size,curr.st_mtime_ns,curr.st_ino)==(st.st_size,st.st_mtime_ns,st.st_ino):unchanged.append(str(path.resolve()))
+                              except OSError:pass
+                          if len(unchanged)>=2:chosen.extend(unchanged)
+                      selected_bytes=sum(Path(x).stat().st_size for x in chosen)
+                      if chosen:
+                          args=['duperemove','-d','--io-threads=1','--cpu-threads=1',
+                                '--hashfile='+str(out/'jar-duperemove.hash.db')]+chosen
+                          # Outer shell controls total wall clock and I/O priority.
+                          try:
+                              res=subprocess.run(args, stdout=subprocess.PIPE,stderr=subprocess.STDOUT, timeout=90,text=True,errors='replace')
+                              rc=str(res.returncode);note='dedupe_completed' if res.returncode==0 else 'duperemove_error'
+                              (out/'jar-duperemove-last.log').write_text(res.stdout[-12000:])
+                          except subprocess.TimeoutExpired as e:
+                              rc='timeout';note='duperemove_timeout'
+                      else:note='verified_files_became_active'
+              after=host_free();backing_after=physical(a.backing)
+              # Concurrent Ninja writes can hide actual savings; record BOTH raw deltas.
+              if a.mode=='adaptive' and rc=='0' and (after-before)>=64*MIB:
+                  state['promoted']=True
+              state['last_run']=timestamp();state['last_note']=note
+              state_path.write_text(json.dumps(state,indent=2)+'\n')
+              with summary_file.open('a') as f:
+                  values=[timestamp(),a.mode,fs,count,total,stable_count,candidates,hashed,hashed_count,duplicate_files,duplicate_bytes,selected_bytes,rc,before,after,backing_before,backing_after,note]
+                  f.write('\t'.join(str(v) for v in values)+'\n')
+              print(f'JAR_DEDUPE mode={a.mode} fs={fs} jars={count} logical_gib={total/GIB:.2f} same_size_upper_gib={candidates/GIB:.2f} sha_duplicate_gib={duplicate_bytes/GIB:.2f} selected_gib={selected_bytes/GIB:.2f} host_delta_gib={(after-before)/GIB:.2f} backing_delta_gib={(backing_before-backing_after)/GIB:.2f} note={note}')
+              return 0
+          
+          if __name__=='__main__': sys.exit(main())
+          PY_JAR_DEDUPE
+          python3 -m py_compile /tmp/rbe-test/ci_jar_dedupe.py
+          command -v duperemove || true
+          echo "JAR_DEDUPE_ANALYZER_READY mode=$JAR_DEDUPE_MODE"
 
       - name: Configure primary Soong Go runtime and heap telemetry
         working-directory: /home/runner/work/los
@@ -2198,6 +2428,30 @@ jobs:
             ) >> /tmp/rbe-test/soong-storage-profile.log 2>&1 &
           }
 
+          # Run in a separate low-priority process, guarded by flock.
+          # The Ninja supervisor MUST NOT wait for a slow hashing pass.
+          jar_probe_and_dedupe_async() {
+            [ "$JAR_DEDUPE_MODE" != off ] || return 0
+            [ -f /tmp/rbe-test/ci_jar_dedupe.py ] || return 0
+            [ -d out/soong/.intermediates ] || return 0
+            (
+              exec 8>/tmp/rbe-test/jar-dedupe.lock
+              flock -n 8 || exit 0
+              # Use the 10s host-disk guard in the main monitor independently.
+              # Keep I/O priority idle and CPU priority low for the 2-vCPU runner.
+              ionice -c3 nice -n 15 timeout --signal=TERM --kill-after=5s 135s \
+                python3 /tmp/rbe-test/ci_jar_dedupe.py \
+                  --root out/soong/.intermediates \
+                  --diagnostics /tmp/rbe-test \
+                  --mode "$JAR_DEDUPE_MODE" \
+                  --age-minutes "$JAR_DEDUPE_AGE_MINUTES" \
+                  --hash-gib "$JAR_DEDUPE_HASH_GIB" \
+                  --max-files "$JAR_DEDUPE_MAX_FILES" \
+                  --min-host-gib "$JAR_DEDUPE_MIN_FREE_GIB" \
+                || echo "JAR_DEDUPE_WORKER_NONZERO=$?"
+            ) >> /tmp/rbe-test/jar-dedupe-worker.log 2>&1 &
+          }
+
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
           # compiler errors; an external SIGTERM is separately captured above.
@@ -2355,6 +2609,13 @@ jobs:
               if (( available < DISK_WARN_GIB * 1073741824 && warned == 0 )); then
                 echo "::warning::Less than ${DISK_WARN_GIB} GiB available in $phase."
                 warned=1
+              fi
+              # At most one bounded SHA-256 / duperemove pilot per interval.
+              # No concurrent workers: flock protects the state and hash DB.
+              # Only full ROM stage, never Soong graph or scanner smoke tests.
+              if [ "$phase" = full-rom-build ] \
+                 && (( sample_counter % JAR_DEDUPE_INTERVAL_SAMPLES == 0 )); then
+                jar_probe_and_dedupe_async || true
               fi
               if (( idle_secs >= 900 && idle_warned == 0 )); then
                 echo "::warning::$phase has produced no new log output for 15 minutes; inspect CPU/process state."
@@ -3369,6 +3630,27 @@ jobs:
           echo '=== HOST BACKING IMAGE AFTER BUILD ==='
           df -B1 --output=avail / | tail -2
           stat -c 'image_blocks=%b image_block_size=%B' /tmp/los20-workspace-btrfs.img 2>/dev/null || true
+
+      - name: Final bounded JAR duplicate census (read only)
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          ROOT=out/soong/.intermediates
+          DIR="$(readlink -f /tmp/rbe-test 2>/dev/null)"
+          test -f "$DIR/ci_jar_dedupe.py" && test -d "$ROOT" || exit 0
+          echo '=== FINAL JAR DUPLICATE CENSUS (READ-ONLY) ==='
+          # Skip if another protected dedupe pass is still in progress.
+          (
+            exec 8>"$DIR/jar-dedupe.lock"
+            flock -n 8 || exit 0
+            ionice -c3 nice -n 15 timeout 85s python3 "$DIR/ci_jar_dedupe.py" \
+              --root "$ROOT" --diagnostics "$DIR" --mode probe \
+              --age-minutes 10 --hash-gib 2 --max-files 250
+          ) >> "$DIR/jar-dedupe-worker.log" 2>&1 || true
+          echo '=== JAR DEDUPE SUMMARY ==='
+          tail -n 8 "$DIR/jar-dedupe-runs.tsv" 2>/dev/null | cut -c 1-300 || true
 
       - name: Finalize RBE metrics after compilation stops
         if: always()
