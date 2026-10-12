@@ -49,7 +49,7 @@ jobs:
 
       # Keep all RBE diagnostics in one place.
       RBE_log_dir: "/tmp/rbe-test"
-      RBE_log_path: "text:///tmp/rbe-test/reproxy_log.txt"
+      # No RBE_log_path: deprecated duplicate action log; proxy_log_dir is retained.
       RBE_proxy_log_dir: "/tmp/rbe-test"
       RBE_output_dir: "/tmp/rbe-test"
       RBE_reproxy_wait_seconds: "30"
@@ -57,6 +57,13 @@ jobs:
       # RBE logs are written into the compressed workspace through /tmp/rbe-test.
       # Keep provenance and clean older Git object packs only after graph generation.
       SAFE_GIT_OBJECT_TRIM: "1"
+      # After recording a real revision-locked manifest, reclaim extra Git-only
+      # object stores; not the checked-out clang/misc toolchain files.
+      SAFE_GIT_EXTENDED_TRIM: "1"
+      # Retain full RBE metrics and error tails; do not rotate a live reproxy FD.
+      RBE_CLOSED_INFO_MAX_MIB: "32"
+      RBE_LOG_SCAN_INTERVAL_SAMPLES: "6"
+      DISK_PROFILE_INTERVAL_SAMPLES: "30"
       RBE_INFO_KEEP_MIB: "4"
       RBE_RRPL_KEEP_MIB: "32"
 
@@ -253,7 +260,7 @@ jobs:
           # RBE uses /tmp/rbe-test internally. Place its backing directory under
           # the existing compressed Btrfs workspace so INFO/rrpl do not fill /tmp.
           # Also works in plain mode; the reduction is compression-dependent.
-          DST=/home/runner/work/los/.rbe-diagnostics
+          DST=/home/runner/work/los/rbe-diagnostics
           test -d /home/runner/work/los
           mkdir -p "$DST"
           if [ -L /tmp/rbe-test ]; then
@@ -264,7 +271,11 @@ jobs:
             rm -rf -- /tmp/rbe-test
             ln -s "$DST" /tmp/rbe-test
           fi
-          echo "diagnostic_realpath=$(readlink -f /tmp/rbe-test)"             > /tmp/rbe-test/diagnostic-location.txt
+          echo "diagnostic_realpath=$(readlink -f /tmp/rbe-test)" > /tmp/rbe-test/diagnostic-location.txt
+          # Check physical location, not du on the /tmp symlink (which yields 0).
+          REAL_DIAG="$(readlink -f /tmp/rbe-test)"
+          test "$REAL_DIAG" = "$DST"
+          echo "diag_bytes=$(du -sk "$REAL_DIAG" | awk '{print $1*1024}')"
           df -hT / "$DST"
           findmnt -T "$DST" -o SOURCE,FSTYPE,OPTIONS
           echo 'Reproxy diagnostics are now stored in the Android workspace.'
@@ -1958,6 +1969,84 @@ jobs:
           sample_soong_memory pre-graph
           sample_soong_processes pre-graph
 
+          # Live diagnostics: NEVER truncate a file still opened by reproxy.
+          # The glog active INFO fd can otherwise develop sparse holes on writes.
+          # Reclaim completed/closed INFO rotations only, and retain tails.
+          rbe_prune_closed_info() {
+            python3 - "$RBE_CLOSED_INFO_MAX_MIB" "$RBE_INFO_KEEP_MIB" <<'PYPRUNE'
+          import os, pathlib, subprocess, sys, time
+          root=pathlib.Path('/tmp/rbe-test').resolve()
+          if not root.is_dir(): sys.exit(0)
+          threshold=int(sys.argv[1])*1048576
+          keep=int(sys.argv[2])*1048576
+          busy=set()
+          # Enumerate just the fds of reproxy, not all processes on the runner.
+          try:
+              proc=subprocess.run(['pgrep','-x','reproxy'],capture_output=True,text=True,check=False)
+              pids=[int(x) for x in proc.stdout.split() if x.isdigit()]
+          except Exception: pids=[]
+          for pid in pids:
+              fddir=pathlib.Path(f'/proc/{pid}/fd')
+              try:
+                  for fd in fddir.iterdir():
+                      try:
+                          st=fd.stat()
+                          busy.add((st.st_dev,st.st_ino))
+                      except OSError: pass
+              except OSError: pass
+          changed=[]
+          for file in root.iterdir():
+              if file.is_symlink() or not file.is_file(): continue
+              name=file.name
+              if not (name.startswith(('reproxy.','bootstrap.','rewrapper.','scandeps_server.')) and
+                     ('.INFO.' in name or name.endswith('.INFO'))): continue
+              st=file.stat()
+              if st.st_size <= threshold or time.time()-st.st_mtime < 120: continue
+              if (st.st_dev,st.st_ino) in busy: continue
+              # Stale files only: preserve the last 4MiB for debugging.
+              tmp=file.with_name(file.name+'.ci-compact')
+              try:
+                  with file.open('rb') as src, tmp.open('wb') as dst:
+                      src.seek(-min(keep,st.st_size),os.SEEK_END)
+                      while True:
+                          buf=src.read(1048576)
+                          if not buf: break
+                          dst.write(buf)
+                  os.replace(tmp,file)
+                  changed.append((name,st.st_size,file.stat().st_size))
+              finally:
+                  tmp.unlink(missing_ok=True)
+          log=root/'rbe-live-info-compaction.tsv'
+          if changed:
+              with log.open('a') as f:
+                  for n,b,a in changed:
+                      f.write(f'{time.time():.0f}\t{n}\t{b}\t{a}\n')
+              print(f'RBE_CLOSED_INFO_COMPACTED count={len(changed)} bytes_saved={sum(b-a for _,b,a in changed)}')
+          PYPRUNE
+          }
+          # Profiles bytes actually occupying disk, not only logical Btrfs space.
+          sample_build_disk_breakdown() {
+            local now image_bytes root_free log_bytes
+            now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            root_free="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
+            image_bytes=0
+            if [ -f "$BTRFS_BACKING" ]; then
+              read -r blocks bsize < <(stat -c '%b %B' "$BTRFS_BACKING")
+              image_bytes=$((blocks*bsize))
+            fi
+            # du can be expensive on out/ at ~100GiB; run only every ~5 minutes.
+            local soong_kib target_kib repo_kib
+            soong_kib="$(du -sk out/soong 2>/dev/null | awk '{print $1}')"
+            target_kib="$(du -sk out/target 2>/dev/null | awk '{print $1}')"
+            repo_kib="$(du -sk .repo 2>/dev/null | awk '{print $1}')"
+            log_bytes="$(du -sk "$(readlink -f /tmp/rbe-test)" 2>/dev/null | awk '{print $1*1024}')"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$root_free" "$image_bytes" "${soong_kib:-0}" "${target_kib:-0}" "${repo_kib:-0}" >> /tmp/rbe-test/build-storage-breakdown.tsv
+            printf '%s\t%s\n' "$now" "${log_bytes:-0}" >> /tmp/rbe-test/rbe-log-size-samples.tsv
+            echo "STORAGE_PROFILE root_free_gib=$((root_free/1073741824)) image_gib=$((image_bytes/1073741824)) out_soong_mib=$((${soong_kib:-0}/1024)) out_target_mib=$((${target_kib:-0}/1024)) repo_mib=$((${repo_kib:-0}/1024)) rbe_log_bytes=${log_bytes:-0}"
+          }
+          printf 'timestamp\troot_available_bytes\timage_physical_bytes\tout_soong_kib\tout_target_kib\trepo_kib\n' > /tmp/rbe-test/build-storage-breakdown.tsv
+          printf 'timestamp\trbe_diagnostics_bytes\n' > /tmp/rbe-test/rbe-log-size-samples.tsv
+
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
           # compiler errors; an external SIGTERM is separately captured above.
@@ -2068,6 +2157,15 @@ jobs:
                 record_memory_pressure "$phase"
               fi
               sample_counter=$((sample_counter + 1))
+              # Trim only inactive INFO rotations every ~60 seconds, never .rrpl.
+              if (( sample_counter % RBE_LOG_SCAN_INTERVAL_SAMPLES == 0 )); then
+                rbe_prune_closed_info || true
+              fi
+              # Separate size attributions at ~5-minute cadence, including Btrfs
+              # physical allocation (stat blocks) and the real log target.
+              if (( sample_counter % DISK_PROFILE_INTERVAL_SAMPLES == 0 )); then
+                sample_build_disk_breakdown || true
+              fi
 
               if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ] \
                  && (( guard_consecutive >= GRAPH_MEM_GUARD_SAMPLES )); then
@@ -2281,6 +2379,14 @@ jobs:
           .repo/project-objects/LineageOS/android_cts.git
           .repo/project-objects/platform/external/deqp.git
           EOFTRIMTARGETS
+            if [ "${SAFE_GIT_EXTENDED_TRIM:-0}" = 1 ]; then
+              # These directories are Git object stores, not working-tree files.
+              # Risk: later `git` commands for these projects will not function.
+              cat >> /tmp/rbe-test/git-trim-targets.txt <<'EOFTRIMEXT'
+          .repo/project-objects/platform/prebuilts/misc.git
+          .repo/project-objects/platform/prebuilts/clang/host/linux-x86.git
+          EOFTRIMEXT
+            fi
             ROOT_BEFORE="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
             IMAGE_BEFORE="$(stat -c '%b %B' "$BTRFS_BACKING" 2>/dev/null || echo '0 0')"
             printf 'target\tlogical_bytes_before\tstatus\n' > /tmp/rbe-test/git-cleanup-sizes.tsv
@@ -2288,7 +2394,7 @@ jobs:
               [ -n "$candidate" ] || continue
               # Exact allowlist. No dynamic paths and never delete .repo/repo.
               case "$candidate" in
-                .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git) ;;
+                .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git|.repo/project-objects/platform/prebuilts/misc.git|.repo/project-objects/platform/prebuilts/clang/host/linux-x86.git) ;;
                 *) echo "::error::Refusing unexpected Git trim path: $candidate"; exit 1 ;;
               esac
               if [ -L "$candidate" ]; then
@@ -2297,8 +2403,11 @@ jobs:
               fi
               if [ -d "$candidate" ]; then
                 kib="$(du -sk "$candidate" | awk '{print $1}')"
-                printf '%s\t%s\tremoved\n' "$candidate" "$((kib*1024))"                   >> /tmp/rbe-test/git-cleanup-sizes.tsv
+                printf '%s\t%s\tremoved\n' "$candidate" "$((kib*1024))" >> /tmp/rbe-test/git-cleanup-sizes.tsv
+                echo "Removing Git object-only directory: $candidate ($(($kib/1024)) MiB logical)"
                 rm -rf -- "$candidate"
+              else
+                printf '%s\t0\tabsent\n' "$candidate" >> /tmp/rbe-test/git-cleanup-sizes.tsv
               fi
             done < /tmp/rbe-test/git-trim-targets.txt
             # abi-dumps has subprojects; remove only its direct *.git dirs.
@@ -2911,11 +3020,11 @@ jobs:
           tail -n 180 /tmp/rbe-test/configure-setup.log 2>/dev/null || true
 
           echo "=== RBE LOG DIRECTORY ==="
-          find /tmp/rbe-test \
+          find "$(readlink -f /tmp/rbe-test)" \
             -maxdepth 2 \
             -type f \
             -printf '%p %s bytes\n' \
-            | sort || true
+            | sort | tail -n 80 || true
 
           echo "=== REPROXY PROCESSES ==="
           ps aux | grep -E '[r]eproxy|[r]ewrapper|[s]candeps' || true
@@ -3050,14 +3159,34 @@ jobs:
           rm -rf /tmp/buildbuddy-rbe-bridge
           echo "BuildBuddy bridge configuration removed."
 
+      - name: Finalize RBE metrics after compilation stops
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          test -d /tmp/rbe-test || exit 0
+          echo '=== BEST EFFORT REPROXY GRACEFUL SHUTDOWN ==='
+          # All m/ninja commands have exited. bootstrap -shutdown flushes stats.
+          if pgrep -x reproxy >/dev/null && [ -x "${RBE_DIR}/bootstrap" ]; then
+            timeout 60s "${RBE_DIR}/bootstrap" -shutdown -output_dir=/tmp/rbe-test \
+              > /tmp/rbe-test/reproxy-finalize.log 2>&1
+            RC=$?
+            echo "bootstrap_shutdown_rc=$RC"
+          fi
+          if pgrep -x reproxy >/dev/null; then
+            echo '::warning::reproxy is still active: active logs will remain untouched.'
+          fi
+          ls -lh /tmp/rbe-test/rbe_metrics* 2>/dev/null || true
+
       - name: Compact inactive reproxy logs while retaining failures
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          DIR=/tmp/rbe-test
+          DIR="$(readlink -f /tmp/rbe-test)"
           test -d "$DIR" || exit 0
-          echo '=== BEFORE RBE LOG COMPACTION ==='
+          echo '=== BEFORE RBE LOG COMPACTION (REAL DIRECTORY) ==='
           du -sh "$DIR" || true
           # Do not mutate live reproxy logs, or consume active .rrpl during shutdown.
           if pgrep -x reproxy >/dev/null 2>&1; then
@@ -3095,8 +3224,55 @@ jobs:
           du -sh "$DIR" || true
           df -h /
 
-      - name: Redact BuildBuddy API key from RBE artifacts
+      - name: Stage bounded, explicit diagnostic artifact
+        id: stage_diagnostics
         if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$(readlink -f /tmp/rbe-test)"
+          DST=/home/runner/work/los/rbe-upload
+          mkdir -p "$DST"
+          python3 - "$SRC" "$DST" <<'PYSTAGE'
+          import os, pathlib, sys
+          src,dst=(pathlib.Path(a) for a in sys.argv[1:])
+          if not src.is_dir(): raise SystemExit(0)
+          # Whitelist file types. Never copy raw rrpl, INFO, key-bearing
+          # reproxy command dumps, or a multi-GiB compiler output wholesale.
+          forbidden=('.rrpl','.rpl','.redacting','.compact')
+          count=0
+          for file in src.iterdir():
+              if file.is_symlink() or not file.is_file(): continue
+              name=file.name
+              if name.startswith(('reproxy.','bootstrap.','rewrapper.','scandeps_server.')) or name.endswith(forbidden): continue
+              if name.startswith('reproxy_') and '.rrpl' in name: continue
+              if file.suffix not in ('.txt','.tsv','.log','.xml','.patch','.pb','.json','.md'):
+                  continue
+              # Risky raw action logs / unbounded CI compiler output are excluded.
+              if 'reproxy_log' in name or 'reproxy.INFO' in name: continue
+              size=file.stat().st_size
+              limit=6*1048576 if name in ('full-rom-build.log','m-nothing.log') else 3*1048576
+              if file.suffix=='.pb': limit=8*1048576
+              with file.open('rb') as source, (dst/name).open('wb') as target:
+                  if size > limit:
+                      # Take end to capture failure; annotate truncation clearly.
+                      target.write(f'[TRUNCATED LOG: original_bytes={size}, preserved_tail_bytes={limit}]\n'.encode())
+                      source.seek(-limit,os.SEEK_END)
+                  while True:
+                      chunk=source.read(1048576)
+                      if not chunk: break
+                      target.write(chunk)
+              count+=1
+          (dst/'artifact-stage-summary.txt').write_text(f'files={count}\nraw_rrpl_excluded=true\nlarge_logs_tailed=true\n')
+          print(f'Diagnostic files staged: {count}')
+          PYSTAGE
+          echo '=== UPLOAD PAYLOAD SIZE ==='
+          du -sh "$DST"
+          df -h /
+
+      - name: Redact BuildBuddy API key from RBE artifacts
+        id: redact_diagnostics
+        if: ${{ always() && steps.stage_diagnostics.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -3106,8 +3282,9 @@ jobs:
           import os
           from pathlib import Path
           key=os.environ.get('BUILDBUDDY_API_KEY','').encode()
-          root=Path('/tmp/rbe-test')
-          if not key or not root.is_dir(): raise SystemExit(0)
+          # Redact ONLY the bounded upload snapshot, not multi-GiB active raw RBE logs.
+          root=Path('/home/runner/work/los/rbe-upload')
+          if not key or not root.is_dir(): raise SystemExit('Refusing unredacted diagnostics upload: key or staging missing')
           assert len(key)>0
           chunk=1024*1024
           for file in root.rglob('*'):
@@ -3136,14 +3313,13 @@ jobs:
           PYREDACT
 
       - name: Upload full ROM trial diagnostics
-        if: always()
+        # Never upload if staging/redaction failed; even partial logs may contain secrets.
+        if: ${{ always() && steps.stage_diagnostics.outcome == 'success' && steps.redact_diagnostics.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: rbe-test-logs-${{ github.run_id }}
-          path: |
-            /home/runner/work/los/.rbe-diagnostics
-            /home/runner/work/los/.repo/repo.log
-          if-no-files-found: warn
+          path: /home/runner/work/los/rbe-upload/
+          if-no-files-found: error
           retention-days: 7
 
       # Always run AFTER ROM and diagnostic uploads; keep mount live for upload.
