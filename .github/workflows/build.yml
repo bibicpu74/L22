@@ -11,6 +11,32 @@ on:
         options:
           - btrfs_zstd
           - plain
+      debug_info_level:
+        description: "Clang C/C++ DWARF: minimal (saves build space), none, or full"
+        type: choice
+        required: true
+        default: debug_level_1
+        options:
+          - debug_level_1
+          - debug_level_0
+          - debug_level_g
+      btrfs_zstd_level:
+        description: "Btrfs workspace ZSTD level; 3 uses more local CPU"
+        type: choice
+        required: true
+        default: '1'
+        options:
+          - '1'
+          - '3'
+      remote_jobs:
+        description: "Parallel RBE actions (20 experimental; 16 previous stable)"
+        type: choice
+        required: true
+        default: '20'
+        options:
+          - '16'
+          - '20'
+          - '24'
 
 permissions:
   contents: read
@@ -28,6 +54,12 @@ jobs:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
       WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
       BTRFS_WORKSPACE_IMAGE_GIB: "220"
+      # Official LineageOS 21 Soong option; changes emitted DWARF, not runtime ABI.
+      # Full debug = debug_level_g; minimal = debug_level_1; none = debug_level_0.
+      CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_1' }}"
+      BTRFS_ZSTD_LEVEL: "${{ inputs.btrfs_zstd_level || '1' }}"
+      SOONG_PROFILE_INTERVAL_SAMPLES: "360"  # 10s monitor x 360 = about 60 minutes
+      SOONG_PROFILE_TIMEOUT_SECONDS: "80"
 
       # Android / Soong RBE
       USE_RBE: "1"
@@ -68,8 +100,8 @@ jobs:
       RBE_RRPL_KEEP_MIB: "32"
 
       # Android Soong uses remote Ninja concurrency independently of -j2.
-      # Keep the 2-job local pool, highmem pool=1; try up to 16 remote actions.
-      NINJA_REMOTE_NUM_JOBS: "16"
+      # Keep the 2-job local pool, highmem pool=1; selectable 16/20/24 remote actions.
+      NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '20' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
       # Soong graph generation is local even with BuildBuddy RBE.
@@ -109,9 +141,10 @@ jobs:
       # Never let the free space reach zero; packaging may still need more.
       DISK_WARN_GIB: "15"
       DISK_STOP_GIB: "7"
-      # Stop the long build early enough to upload logs and a successful ROM.
+      # Preserve time for post-build metrics and artifact upload; no guarantee
+      # the ~173k-Ninja-edge ROM fits within 6 hours even after optimization.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "320"
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "335"
 
     steps:
       - name: Reclaim root disk
@@ -191,6 +224,7 @@ jobs:
             xsltproc \
             zip \
             zlib1g-dev \
+            zstd \
             python3 \
             python-is-python3 \
             openjdk-21-jdk-headless \
@@ -236,11 +270,12 @@ jobs:
           truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
           sudo mkfs.btrfs -f -m single -d single "$BACKING" \
             > /tmp/rbe-test/btrfs-mkfs.log 2>&1
-          sudo mount -t btrfs -o loop,compress=zstd:1,noatime \
+          case "$BTRFS_ZSTD_LEVEL" in 1|3) ;; *) echo '::error::Unsupported ZSTD level'; exit 1 ;; esac
+          sudo mount -t btrfs -o "loop,compress=zstd:${BTRFS_ZSTD_LEVEL},noatime" \
             "$BACKING" "$WORKSPACE"
           sudo chown "$(id -u):$(id -g)" "$WORKSPACE"
           test "$(stat -f -c '%T' "$WORKSPACE")" = btrfs
-          echo '=== ANDROID 13 FULL WORKSPACE ZSTD ==='
+          echo '=== ANDROID 14 FULL WORKSPACE ZSTD ==='
           findmnt -T "$WORKSPACE" -o SOURCE,FSTYPE,OPTIONS
           df -hT / "$WORKSPACE"
           du -h "$BACKING"
@@ -892,6 +927,108 @@ jobs:
       # P0/P1: AOSP launches the main graph tool via `env -i`. Go environment
       # exports from GitHub Actions therefore do not reliably reach it.
       # Apply GC controls inside the real `soong_build` process instead.
+      # No file mutation of .o/.a/.so while Ninja is running. The official
+      # CLANG_DEFAULT_DEBUG_LEVEL is implemented in build/soong/cc/config/global.go.
+      # A small preflight checks the actual Clang toolchain and writes a profiler
+      # for bounded, read-only sampling later in the build.
+      - name: Validate DWARF size optimization and install Soong profiler
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CLANG_DEFAULT_DEBUG_LEVEL" in
+            debug_level_0|debug_level_1|debug_level_g) ;;
+            *) echo "::error::Invalid CLANG_DEFAULT_DEBUG_LEVEL"; exit 1 ;;
+          esac
+          case "$NINJA_REMOTE_NUM_JOBS" in 16|20|24) ;; *) exit 1 ;; esac
+          test -s build/soong/cc/config/global.go
+          if ! grep -Fq 'CLANG_DEFAULT_DEBUG_LEVEL' build/soong/cc/config/global.go; then
+            echo '::error::Checked-out Soong does not implement CLANG_DEFAULT_DEBUG_LEVEL'
+            exit 1
+          fi
+          CLANG=prebuilts/clang/host/linux-x86/clang-r510928/bin/clang++
+          test -x "$CLANG"
+          echo "debug_info_level=$CLANG_DEFAULT_DEBUG_LEVEL" > /tmp/rbe-test/dwarf-config.txt
+          echo "remote_jobs=$NINJA_REMOTE_NUM_JOBS" >> /tmp/rbe-test/dwarf-config.txt
+          echo "btrfs_zstd_level=$BTRFS_ZSTD_LEVEL" >> /tmp/rbe-test/dwarf-config.txt
+          echo "profile_interval_samples=$SOONG_PROFILE_INTERVAL_SAMPLES" >> /tmp/rbe-test/dwarf-config.txt
+          # This is an illustrative microbenchmark, not a 30 GiB savings claim.
+          cat > /tmp/rbe-test/ci-dwarf-probe.cpp <<'CPPSAMPLE'
+          template <typename T, int N> struct Chunk { T data[N]; int get(int i) const { return data[i%N]; } };
+          template <int N> int calculate(int x) { Chunk<int,N> c{}; for (int i=0;i<N;i++) c.data[i]=i*x; return c.get(x); }
+          extern "C" int probe(int x) { return calculate<97>(x)+calculate<197>(x)+calculate<397>(x); }
+          CPPSAMPLE
+          printf 'preset\tobject_bytes\n' > /tmp/rbe-test/dwarf-preflight.tsv
+          for spec in full:-g minimal:-g1 none:-g0; do
+            preset="${spec%%:*}"
+            flag="${spec#*:}"
+            obj="/tmp/rbe-test/ci-dwarf-${preset}.o"
+            "$CLANG" -c -O2 "$flag" -gz=zstd -fdebug-default-version=5 \
+              /tmp/rbe-test/ci-dwarf-probe.cpp -o "$obj"
+            printf '%s\t%s\n' "$preset" "$(stat -c %s "$obj")" >> /tmp/rbe-test/dwarf-preflight.tsv
+          done
+          cat /tmp/rbe-test/dwarf-preflight.tsv
+          cat > /tmp/rbe-test/soong_storage_probe.py <<'PYPROFILE'
+          #!/usr/bin/env python3
+          # Read-only / bounded-memory measurement of Soong intermediates.
+          import collections, datetime, heapq, os, pathlib, sys, time
+          root=pathlib.Path(sys.argv[1]); dest=pathlib.Path(sys.argv[2]); stage=sys.argv[3]
+          dest.mkdir(parents=True,exist_ok=True)
+          if not root.is_dir():
+              print('SOONG_PROFILE_SKIPPED: intermediate directory missing'); sys.exit(0)
+          by_type=collections.defaultdict(lambda:[0,0,0])
+          by_module=collections.defaultdict(lambda:[0,0,0])
+          by_area=collections.defaultdict(lambda:[0,0,0])
+          top=[]; stack=[root]; files=0; total=0; allocated=0; start=time.monotonic()
+          def update(agg,key,sz,bl):
+              value=agg[key];value[0]+=1;value[1]+=sz;value[2]+=bl
+          while stack:
+              current=stack.pop()
+              try:
+                  with os.scandir(current) as it:
+                      for ent in it:
+                          try:
+                              if ent.is_symlink(): continue
+                              if ent.is_dir(follow_symlinks=False): stack.append(ent.path);continue
+                              if not ent.is_file(follow_symlinks=False): continue
+                              st=ent.stat(follow_symlinks=False)
+                          except (OSError,ValueError):continue
+                          rel=os.path.relpath(ent.path,root)
+                          parts=rel.split(os.sep)
+                          ext=pathlib.Path(ent.name).suffix.lower() or '[no extension]'
+                          if ext not in ('.o','.a','.so','.jar','.dex','.vdex','.apk','.zip','.bc','.rsp','.d','.json','.ninja','.txt','.xml','.bin'):
+                              ext='[other]'
+                          sz=st.st_size;bl=st.st_blocks*512
+                          update(by_type,ext,sz,bl)
+                          update(by_area,parts[0] if parts else '[root]',sz,bl)
+                          index=next((i for i,p in enumerate(parts) if p.startswith(('android_','linux_','darwin_'))),None)
+                          module='/'.join(parts[:index]) if index and index>0 else '/'.join(parts[:min(len(parts),4)])
+                          update(by_module,module,sz,bl)
+                          total+=sz;allocated+=bl;files+=1
+                          item=(sz,rel,bl)
+                          if len(top)<60:heapq.heappush(top,item)
+                          elif sz>top[0][0]:heapq.heapreplace(top,item)
+              except (OSError,PermissionError):pass
+          timestamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          def report(name,table,limit):
+              p=dest/name
+              with p.open('w') as f:
+                  f.write('key\tfiles\tlogical_bytes\tst_blocks_bytes\n')
+                  for key,(count,size,block) in sorted(table.items(),key=lambda x:x[1][1],reverse=True)[:limit]:
+                      f.write(f'{key}\t{count}\t{size}\t{block}\n')
+          report('soong-size-by-type.tsv',by_type,40)
+          report('soong-size-by-area.tsv',by_area,50)
+          report('soong-size-by-module.tsv',by_module,150)
+          with (dest/'soong-largest-files.tsv').open('w') as f:
+              f.write('logical_bytes\tst_blocks_bytes\tpath\n')
+              for sz,rel,bl in sorted(top,reverse=True):f.write(f'{sz}\t{bl}\t{rel}\n')
+          with (dest/'soong-profile-history.tsv').open('a') as f:
+              f.write(f'{timestamp}\t{stage}\t{files}\t{total}\t{allocated}\t{time.monotonic()-start:.1f}\n')
+          print(f'SOONG_PROFILE stage={stage} files={files} logical_gib={total/2**30:.2f} allocated_est_gib={allocated/2**30:.2f}')
+          PYPROFILE
+          python3 -m py_compile /tmp/rbe-test/soong_storage_probe.py
+          echo 'SOONG_STORAGE_PROFILER_READY'
+
       - name: Configure primary Soong Go runtime and heap telemetry
         working-directory: /home/runner/work/los
         shell: bash
@@ -1499,7 +1636,7 @@ jobs:
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # The 320-minute job-clock guard below leaves time for cleanup/upload.
-        timeout-minutes: 325
+        timeout-minutes: 345
         shell: bash
         run: |
           set -eo pipefail
@@ -2047,6 +2184,20 @@ jobs:
           printf 'timestamp\troot_available_bytes\timage_physical_bytes\tout_soong_kib\tout_target_kib\trepo_kib\n' > /tmp/rbe-test/build-storage-breakdown.tsv
           printf 'timestamp\trbe_diagnostics_bytes\n' > /tmp/rbe-test/rbe-log-size-samples.tsv
 
+          profile_soong_intermediates() {
+            local phase="$1" tag="$2"
+            if [ ! -f /tmp/rbe-test/soong_storage_probe.py ]; then return 0; fi
+            if [ ! -d out/soong/.intermediates ]; then return 0; fi
+            # Run asynchronously so the 10s disk guard is never blocked by a
+            # potentially slow scan over hundreds of thousands of entries.
+            (
+              exec 9>/tmp/rbe-test/soong-storage-profile.lock
+              flock -n 9 || exit 0
+              timeout "${SOONG_PROFILE_TIMEOUT_SECONDS}s" python3 /tmp/rbe-test/soong_storage_probe.py \
+                out/soong/.intermediates /tmp/rbe-test "${phase}-${tag}"
+            ) >> /tmp/rbe-test/soong-storage-profile.log 2>&1 &
+          }
+
           # Shared supervisor for both 'nothing' and 'bacon'. It records an
           # explicit phase exit code and distinguishes disk/time stops from
           # compiler errors; an external SIGTERM is separately captured above.
@@ -2165,6 +2316,10 @@ jobs:
               # physical allocation (stat blocks) and the real log target.
               if (( sample_counter % DISK_PROFILE_INTERVAL_SAMPLES == 0 )); then
                 sample_build_disk_breakdown || true
+              fi
+              if [ "$phase" = full-rom-build ] \
+                 && (( sample_counter % SOONG_PROFILE_INTERVAL_SAMPLES == 0 )); then
+                profile_soong_intermediates "$phase" "$sample_counter" || true
               fi
 
               if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ] \
@@ -2627,6 +2782,21 @@ jobs:
             exit 73
           fi
           sed -n '1,8p' "$RBE_PROBE_LOG"
+          echo '=== VERIFY CLANG DWARF LEVEL IN REAL RBE COMPILE COMMAND ==='
+          python3 - "$RBE_PROBE_LOG" "$CLANG_DEFAULT_DEBUG_LEVEL" <<'PYDWARF'
+          import pathlib,re,sys
+          content=pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          mode=sys.argv[2]
+          wanted={'debug_level_0':'-g0','debug_level_1':'-g1','debug_level_g':'-g'}[mode]
+          observed=re.findall(r'(?<!\S)-g(?:[0123])?(?!\S)',content)
+          with pathlib.Path('/tmp/rbe-test/dwarf-ninja-verification.txt').open('w') as out:
+              out.write(f'mode={mode} wanted={wanted} observed={observed[:30]}\n')
+          # A compile may use a later module-specific -g override; do not claim
+          # this one representative libbase command proves all modules are optimized.
+          if wanted not in observed:
+              raise SystemExit(f'DWARF setting {wanted} is missing in libbase Ninja compile sample; check Soong propagation')
+          print(f'DWARF_NINJA_PROBE_PASSED mode={mode} flags={observed[:10]}')
+          PYDWARF
           echo '=== PINNED RECLIENT OUTPUT PATH CHECK ==='
           cat /tmp/rbe-test/reclient-version.txt
           test -x "$RBE_DIR/rewrapper"
@@ -3158,6 +3328,47 @@ jobs:
           fi
           rm -rf /tmp/buildbuddy-rbe-bridge
           echo "BuildBuddy bridge configuration removed."
+
+      - name: Final Soong intermediates profile and ZSTD comparison
+        if: always()
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          DIR="$(readlink -f /tmp/rbe-test 2>/dev/null)"
+          [ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
+          if [ -f "$DIR/soong_storage_probe.py" ]; then
+            timeout 100s python3 "$DIR/soong_storage_probe.py" \
+              out/soong/.intermediates "$DIR" final \
+              >> "$DIR/soong-storage-profile.log" 2>&1 || true
+          fi
+          echo '=== SOONG BIGGEST OUTPUT TYPES ==='
+          head -n 18 "$DIR/soong-size-by-type.tsv" 2>/dev/null || true
+          echo '=== SOONG BIGGEST MODULES ==='
+          head -n 18 "$DIR/soong-size-by-module.tsv" 2>/dev/null || true
+          # ZSTD 1 vs 3 comparison is read-only and bounded (no new image data).
+          # A userspace file ratio is not identical to physical Btrfs extent savings.
+          if command -v zstd >/dev/null && [ -s "$DIR/soong-largest-files.tsv" ]; then
+            printf 'file\traw_bytes\tzstd1_bytes\tzstd3_bytes\n' > "$DIR/soong-zstd-comparison.tsv"
+            count=0
+            while IFS=$'\t' read -r logical blocks rel; do
+              [[ "$logical" =~ ^[0-9]+$ ]] || continue
+              # 0.5 MiB to 32 MiB and only compiler/linker inputs.
+              if (( logical < 524288 || logical > 33554432 )); then continue; fi
+              case "$rel" in *.o|*.a|*.so) ;; *) continue ;; esac
+              file="out/soong/.intermediates/$rel"
+              [ -f "$file" ] || continue
+              if ! b1="$(timeout 12s zstd -q -1 -c -- "$file" | wc -c)"; then continue; fi
+              if ! b3="$(timeout 12s zstd -q -3 -c -- "$file" | wc -c)"; then continue; fi
+              printf '%s\t%s\t%s\t%s\n' "$rel" "$logical" "$b1" "$b3" >> "$DIR/soong-zstd-comparison.tsv"
+              count=$((count+1))
+              (( count >= 12 )) && break
+            done < "$DIR/soong-largest-files.tsv"
+          fi
+          echo '=== HOST BACKING IMAGE AFTER BUILD ==='
+          df -B1 --output=avail / | tail -2
+          stat -c 'image_blocks=%b image_block_size=%B' /tmp/los20-workspace-btrfs.img 2>/dev/null || true
 
       - name: Finalize RBE metrics after compilation stops
         if: always()
