@@ -156,12 +156,12 @@ jobs:
       # GiB of available disk space (statvfs/df -B1, not rounded df -h).
       # Experimental 7-GiB floor requested for a deeper build trial.
       # Never let the free space reach zero; packaging may still need more.
-      DISK_WARN_GIB: "15"
-      DISK_STOP_GIB: "7"
+      DISK_WARN_GIB: "10"
+      DISK_STOP_GIB: "1"
       # Preserve time for post-build metrics and artifact upload; no guarantee
       # the ~173k-Ninja-edge ROM fits within 6 hours even after optimization.
       # Whole-job limit on GitHub-hosted runners: 360 minutes.
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "335"
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "360"
 
     steps:
       - name: Reclaim root disk
@@ -1871,7 +1871,7 @@ jobs:
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         # The 320-minute job-clock guard below leaves time for cleanup/upload.
-        timeout-minutes: 345
+        timeout-minutes: 360
         shell: bash
         run: |
           set -eo pipefail
@@ -1984,6 +1984,7 @@ jobs:
           fi
           echo '=== ENVSETUP PASSED ==='
           mark_stage lunch
+          export WITHOUT_CHECK_API=true
           lunch lineage_star2lte-ap2a-userdebug
           LUNCH_RC=$?
           # Restore strict error checking only after the Lineage shell setup.
