@@ -1984,7 +1984,6 @@ jobs:
           fi
           echo '=== ENVSETUP PASSED ==='
           mark_stage lunch
-          export WITHOUT_CHECK_API=true
           lunch lineage_star2lte-ap2a-userdebug
           LUNCH_RC=$?
           # Restore strict error checking only after the Lineage shell setup.
