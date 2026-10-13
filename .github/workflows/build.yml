@@ -2486,7 +2486,7 @@ jobs:
                 # Graph-specific profiling must not slow down full ROM compile.
                 unset GOMAXPROCS GODEBUG || true
               fi
-              m -j2 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
+              m -j3 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
               printf '%s\n' "$rc" > "$status_file"
               exit "$rc"
@@ -3883,4 +3883,4 @@ jobs:
             echo 'Btrfs workspace detached; backing image removed.'
           else
             echo '::warning::Btrfs mount busy; leaving image to runner teardown.'
-          fi
+          fivvvvvvvvvvvvvvvv
