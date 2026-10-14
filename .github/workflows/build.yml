@@ -86,8 +86,10 @@ jobs:
       RBE_RRPL_KEEP_MIB: "32"
 
       # RBE & Ninja concurrency
+      # Keep local jobs at 2 to prevent local Java/R8/LLD OOM; RBE runs 24 remote jobs independently.
       NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
+      LOCAL_NINJA_JOBS: "2"
 
       # Soong Go GC tuning for graph generation
       SOONG_GOGC: "45"
@@ -100,18 +102,19 @@ jobs:
       GRAPH_MEM_GUARD_SWAP_MIB: "1536"
       GRAPH_MEM_GUARD_SAMPLES: "3"
 
-      # Hybrid graph memory: ZRAM first, disk swap second
+      # Hybrid memory: Keep full 12 GiB disk swap + 8 GiB ZRAM throughout the entire ROM build!
+      # Prevents exit 143 OOM/runner-freeze during heavy late-stage R8/SystemUI/Metalava actions.
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
-      POST_GRAPH_DISK_SWAP_GIB: "4"
-      SOONG_SWAP_DISK_RESERVE_GIB: "12"
+      POST_GRAPH_DISK_SWAP_GIB: "12"
+      SOONG_SWAP_DISK_RESERVE_GIB: "10"
 
       # P1 worktree storage trim
       STORAGE_TRIM_DARWIN_HOST_TOOLS: "1"
       STORAGE_TRIM_OLD_VNDK_ABI: "1"
 
       # Disk & time safety thresholds (348m leaves 12m buffer for artifact upload)
-      DISK_WARN_GIB: "10"
+      DISK_WARN_GIB: "8"
       DISK_STOP_GIB: "1"
       FULL_ROM_SOFT_DEADLINE_MINUTES: "348"
 
@@ -207,7 +210,8 @@ jobs:
             nginx \
             ca-certificates \
             openssl \
-            unzip
+            unzip \
+            linux-modules-extra-$(uname -r) || true
 
           mkdir -p "$HOME/bin"
           curl -fsSL \
@@ -1104,7 +1108,7 @@ jobs:
           echo "::error::BuildBuddy gRPC bridge failed to start."
           exit 1
 
-      - name: Configure hybrid ZRAM and disk swap for Soong graph
+      - name: Configure hybrid ZRAM and 12GiB persistent disk swap
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -1115,22 +1119,24 @@ jobs:
           DISK_STATUS=/tmp/rbe-test/swap-status.txt
           ZRAM_DEVICE_FILE=/tmp/rbe-test/zram-device.txt
           BASE_SWAP=/mnt/soong-swap-base
-          GRAPH_SWAP=/mnt/soong-swap-graph
-          BASE_GIB="${POST_GRAPH_DISK_SWAP_GIB}"
           GIB=1073741824
           : > "$ZRAM_STATUS"
           : > "$DISK_STATUS"
           rm -f "$ZRAM_DEVICE_FILE"
 
+          # Try kernel-default / lz4 / lzo-rle first because ubuntu-24.04 Azure kernels
+          # often reject zstd on zramctl when zstd_compress module is not preloaded.
           if ! command -v zramctl >/dev/null 2>&1; then
             printf 'status=unavailable\nreason=zramctl-not-installed\n' > "$ZRAM_STATUS"
           else
             sudo modprobe zram num_devices=1 2>>/tmp/rbe-test/zram-setup-errors.log || true
             zram_dev=''
-            if zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" --algorithm zstd 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
-              zram_algorithm=zstd
-            elif zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
+            if zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
               zram_algorithm=kernel-default
+            elif zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" --algorithm lz4 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
+              zram_algorithm=lz4
+            elif zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" --algorithm zstd 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
+              zram_algorithm=zstd
             else
               zram_dev=''
               zram_algorithm=unavailable
@@ -1141,11 +1147,14 @@ jobs:
               printf '%s\n' "$zram_dev" > "$ZRAM_DEVICE_FILE"
               printf 'status=enabled\ndevice=%s\nsize_gib=%s\nalgorithm=%s\npriority=100\n' \
                 "$zram_dev" "$SOONG_ZRAM_GIB" "$zram_algorithm" > "$ZRAM_STATUS"
+              echo "ZRAM enabled: $zram_dev (${SOONG_ZRAM_GIB}GiB, $zram_algorithm)"
             else
               printf 'status=unavailable\nreason=kernel-or-activation-error\n' > "$ZRAM_STATUS"
             fi
           fi
 
+          # Allocate a single persistent 12 GiB disk swap file kept alive for the ENTIRE build
+          # so late-stage R8 / Metalava / SystemUI Java actions never exhaust swap and trigger exit 143.
           disk_free_bytes="$(df -B1 --output=avail /mnt | tail -n1 | tr -d ' ')"
           disk_free_gib=$((disk_free_bytes / GIB))
           reserve_gib="${SOONG_SWAP_DISK_RESERVE_GIB}"
@@ -1154,38 +1163,26 @@ jobs:
             target_gib=$((disk_free_gib - reserve_gib))
             if (( target_gib > SOONG_DISK_SWAP_GIB )); then target_gib="$SOONG_DISK_SWAP_GIB"; fi
           fi
-          if (( target_gib < BASE_GIB )); then
-            target_gib=0
-          fi
-          allocate_swap() {
-            local path="$1" size_gib="$2" priority="$3"
-            if ! sudo fallocate -l "${size_gib}G" "$path"; then
-              sudo rm -f "$path" || true
-              return 1
-            fi
-            sudo chmod 600 "$path"
-            if sudo mkswap "$path" >/dev/null && sudo swapon --priority "$priority" "$path"; then
-              return 0
-            fi
-            sudo swapoff "$path" >/dev/null 2>&1 || true
-            sudo rm -f "$path" || true
-            return 1
-          }
           allocated=0
-          if (( target_gib >= BASE_GIB )); then
-            if allocate_swap "$BASE_SWAP" "$BASE_GIB" 20; then
-              allocated="$BASE_GIB"
-              graph_gib=$((target_gib - BASE_GIB))
-              if (( graph_gib > 0 )) && allocate_swap "$GRAPH_SWAP" "$graph_gib" 10; then
-                allocated=$((allocated + graph_gib))
-              fi
+          if (( target_gib >= 4 )); then
+            if sudo fallocate -l "${target_gib}G" "$BASE_SWAP" && \
+               sudo chmod 600 "$BASE_SWAP" && \
+               sudo mkswap "$BASE_SWAP" >/dev/null && \
+               sudo swapon --priority 20 "$BASE_SWAP"; then
+              allocated="$target_gib"
+              echo "Persistent disk swap enabled: $BASE_SWAP (${allocated}GiB)"
+            else
+              sudo swapoff "$BASE_SWAP" >/dev/null 2>&1 || true
+              sudo rm -f "$BASE_SWAP" || true
             fi
           fi
-          printf 'status=%s\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=%s\nreserve_gib=%s\nbase_gib=%s\n' \
+          printf 'status=%s\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=%s\nreserve_gib=%s\n' \
             "$( (( allocated > 0 )) && echo enabled || echo disabled)" \
-            "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$allocated" "$reserve_gib" "$BASE_GIB" \
+            "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$allocated" "$reserve_gib" \
             > "$DISK_STATUS"
+          sudo sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+          free -h
           if ! swapon --noheadings --show=NAME | grep -q .; then
             echo '::error::No active swap device; aborting before the known Soong memory peak.'
             exit 1
@@ -1232,8 +1229,9 @@ jobs:
                 printf 'timestamp=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
               } > /tmp/rbe-test/configure-failure.txt
               echo "::error::Configure failed: stage=$CURRENT_STAGE exit=$rc line=${LAST_FAILURE_LINE:-unknown}"
-              df -h /home/runner/work/los || true
+              df -h / /home/runner/work/los || true
               free -h || true
+              swapon --show || true
             else
               printf 'exit_code=0\nstage=%s\n' "$CURRENT_STAGE" \
                 > /tmp/rbe-test/configure-success.txt
@@ -1286,6 +1284,10 @@ jobs:
           export JAVA_HOME="$JDK17"
           export ANDROID_JAVA_HOME="$JDK17"
           export PATH="$JAVA_HOME/bin:$PATH"
+          # Cap per-JVM heap at 3.5 GiB so concurrent R8 / Metalava / turbine jobs
+          # never consume all 15 GiB RAM + Swap on the GitHub runner.
+          export _JAVA_OPTIONS="-Xmx3584m"
+          export JAVA_TOOL_OPTIONS="-Xmx3584m"
           export USE_CCACHE=0
           export CCACHE_DISABLE=1
           export GOGC="$SOONG_GOGC"
@@ -1343,7 +1345,7 @@ jobs:
             echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
             echo "NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}"
-            echo "NINJA_LOCAL_PARALLEL=$(nproc)"
+            echo "NINJA_LOCAL_PARALLEL=${LOCAL_NINJA_JOBS}"
             echo "WORKSPACE_STORAGE=${WORKSPACE_STORAGE}"
           } | tee /tmp/rbe-test/rbe-env.txt
 
@@ -1517,12 +1519,12 @@ jobs:
                 if [ "$SOONG_GRAPH_GC_TRACE" = 1 ]; then
                   export GODEBUG="${GODEBUG:+${GODEBUG},}gctrace=1"
                 fi
-                LOCAL_JOBS=2
               else
                 unset GOMAXPROCS GODEBUG || true
-                LOCAL_JOBS="$(nproc)"
               fi
-              m -j"$LOCAL_JOBS" --skip-soong-tests "$target" 2>&1 | tee "$log_file"
+              # Keep local -j2 strictly enforced so heavy Java/R8/LLD tasks never OOM the runner;
+              # remote C/C++ still scales to NINJA_REMOTE_NUM_JOBS=24 via Soong remote pool.
+              m -j"${LOCAL_NINJA_JOBS:-2}" --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
               printf '%s\n' "$rc" > "$status_file"
               exit "$rc"
@@ -1623,42 +1625,10 @@ jobs:
             exit "$MONITORED_RC"
           fi
 
-          mark_stage post-graph-swap-reclaim
-          GRAPH_SWAP=/mnt/soong-swap-graph
-          BASE_SWAP=/mnt/soong-swap-base
-          RECLAIM_STATUS=/tmp/rbe-test/graph-swap-reclaim.txt
-          MAX_RECLAIM_USED_BYTES=$((4 * 1024 * 1024 * 1024))
-          MIN_RAM_MARGIN_BYTES=$((2 * 1024 * 1024 * 1024))
-          free_disk_before="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
-          graph_swap_used='na'
-          reclaim_reason='not-present'
-          reclaim_result='retained'
-          if [ -f "$GRAPH_SWAP" ]; then
-            graph_swap_used="$(swapon --bytes --noheadings --show=NAME,USED \
-              | awk -v path="$GRAPH_SWAP" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
-            mem_available_bytes="$(awk '/^MemAvailable:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)"
-            if [[ "$graph_swap_used" =~ ^[0-9]+$ ]] && \
-               swapon --noheadings --show=NAME | grep -Fxq "$BASE_SWAP" && \
-               ! pgrep -x soong_build >/dev/null 2>&1 && \
-               (( graph_swap_used <= MAX_RECLAIM_USED_BYTES )) && \
-               (( mem_available_bytes >= graph_swap_used + MIN_RAM_MARGIN_BYTES )); then
-              if sudo timeout --signal=TERM --kill-after=10s 90s swapoff "$GRAPH_SWAP"; then
-                if ! swapon --noheadings --show=NAME | grep -Fxq "$GRAPH_SWAP"; then
-                  sudo rm -f -- "$GRAPH_SWAP"
-                  reclaim_result='reclaimed'
-                  reclaim_reason='swapoff-success'
-                fi
-              fi
-            fi
-          fi
-          free_disk_after="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
-          freed_disk_bytes=$((free_disk_after - free_disk_before))
-          {
-            printf 'status=%s\nreason=%s\nused_bytes=%s\n' \
-              "$reclaim_result" "$reclaim_reason" "$graph_swap_used"
-            printf 'disk_free_before_bytes=%s\ndisk_free_after_bytes=%s\nreclaimed_disk_bytes=%s\n' \
-              "$free_disk_before" "$free_disk_after" "$freed_disk_bytes"
-          } | tee "$RECLAIM_STATUS"
+          # Retain the full 12 GiB swap for the entire ROM build!
+          echo '=== ACTIVE SWAP RETAINED FOR FULL ROM BUILD ==='
+          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
+          free -h
 
           mark_stage safe-git-objects-cleanup
           LOCK=/tmp/rbe-test/source-manifest-locked.xml
@@ -1763,7 +1733,7 @@ jobs:
 
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
-          echo "RBE remote-only enabled; local jobs=$(nproc), remote=${NINJA_REMOTE_NUM_JOBS}, highmem=1, no local ccache."
+          echo "RBE remote-only enabled; local jobs=${LOCAL_NINJA_JOBS}, remote=${NINJA_REMOTE_NUM_JOBS}, highmem=1, no local ccache."
           enforce_initial_disk_guard pre-build
 
           if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
