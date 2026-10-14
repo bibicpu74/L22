@@ -126,6 +126,8 @@ jobs:
           sudo swapoff -a || true
           sudo rm -f /swapfile /build-swap /mnt/swapfile || true
           sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          
+          # Mở rộng danh sách xóa triệt để các tool mặc định của GitHub Runner
           sudo rm -rf \
             /var/lib/docker \
             /var/lib/containerd \
@@ -134,14 +136,19 @@ jobs:
             /usr/share/dotnet \
             /opt/ghc \
             /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache \
             /usr/local/share/boost \
             /usr/share/swift \
             /usr/local/share/powershell \
             /usr/local/lib/node_modules \
             /usr/local/graalvm \
             /usr/share/rust \
-            /usr/share/php* || true
+            /usr/share/php* \
+            /usr/local/share/chromium \
+            /usr/share/miniconda \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /usr/local/share/vcpkg || true
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
           date +%s > /tmp/rbe-test/job-start-epoch.txt
