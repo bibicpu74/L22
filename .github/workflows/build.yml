@@ -89,7 +89,7 @@ jobs:
       # Keep local jobs at 2 to prevent local Java/R8/LLD OOM; RBE runs 24 remote jobs independently.
       NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
-      LOCAL_NINJA_JOBS: "2"
+      LOCAL_NINJA_JOBS: "3"
 
       # Soong Go GC tuning for graph generation
       SOONG_GOGC: "45"
@@ -115,8 +115,8 @@ jobs:
 
       # Disk & time safety thresholds (348m leaves 12m buffer for artifact upload)
       DISK_WARN_GIB: "8"
-      DISK_STOP_GIB: "1"
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "348"
+      DISK_STOP_GIB: "0"
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "350"
 
     steps:
       - name: Reclaim root disk
@@ -1684,6 +1684,9 @@ jobs:
           .repo/project-objects/platform/prebuilts/sdk.git
           .repo/project-objects/LineageOS/android_cts.git
           .repo/project-objects/platform/external/deqp.git
+          .repo/project-objects/platform/prebuilts/jdk/jdk11.git
+          .repo/project-objects/platform/prebuilts/jdk/jdk9.git
+          .repo/project-objects/platform/prebuilts/jdk/jdk8.git
           EOFTRIMTARGETS
             if [ "${SAFE_GIT_EXTENDED_TRIM:-0}" = 1 ]; then
               cat >> /tmp/rbe-test/git-trim-targets.txt <<'EOFTRIMEXT'
