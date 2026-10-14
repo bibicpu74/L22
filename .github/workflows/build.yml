@@ -1697,7 +1697,7 @@ jobs:
             while IFS= read -r candidate; do
               [ -n "$candidate" ] || continue
               case "$candidate" in
-                .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git|.repo/project-objects/platform/prebuilts/misc.git|.repo/project-objects/platform/prebuilts/clang/host/linux-x86.git) ;;
+                .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git|.repo/project-objects/platform/prebuilts/misc.git|.repo/project-objects/platform/prebuilts/clang/host/linux-x86.git|.repo/project-objects/platform/prebuilts/jdk/jdk11.git|.repo/project-objects/platform/prebuilts/jdk/jdk9.git|.repo/project-objects/platform/prebuilts/jdk/jdk8.git) ;;
                 *) echo "::error::Refusing unexpected Git trim path: $candidate"; exit 1 ;;
               esac
               if [ ! -L "$candidate" ] && [ -d "$candidate" ]; then
