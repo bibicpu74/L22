@@ -1,4 +1,4 @@
-name: LineageOS 21.0 - star2lte Btrfs ZSTD + RBE16 + kernel BPF repair
+name: LineageOS 21.0 - star2lte Btrfs ZSTD + RBE24
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ on:
           - debug_level_0
           - debug_level_g
       btrfs_zstd_level:
-        description: "Btrfs workspace ZSTD level; 3 uses more local CPU"
+        description: "Btrfs workspace ZSTD level; 1 is fastest for OTA packaging"
         type: choice
         required: true
         default: '1'
@@ -29,23 +29,14 @@ on:
           - '1'
           - '3'
       remote_jobs:
-        description: "Parallel RBE actions (20 experimental; 16 previous stable)"
+        description: "Parallel RBE actions (24 recommended for speed)"
         type: choice
         required: true
-        default: '20'
+        default: '24'
         options:
           - '16'
           - '20'
           - '24'
-      jar_dedupe_mode:
-        description: "Soong JAR dedupe: probe-only default, adaptive or disabled"
-        type: choice
-        required: true
-        default: probe
-        options:
-          - probe
-          - adaptive
-          - off
 
 permissions:
   contents: read
@@ -63,105 +54,66 @@ jobs:
       BUILDBUDDY_API_KEY: "${{ secrets.BUILDBUDDY_API_KEY }}"
       WORKSPACE_STORAGE: "${{ inputs.workspace_storage }}"
       BTRFS_WORKSPACE_IMAGE_GIB: "220"
-      # Official LineageOS 21 Soong option; changes emitted DWARF, not runtime ABI.
-      # Full debug = debug_level_g; minimal = debug_level_1; none = debug_level_0.
       CLANG_DEFAULT_DEBUG_LEVEL: "${{ inputs.debug_info_level || 'debug_level_1' }}"
       BTRFS_ZSTD_LEVEL: "${{ inputs.btrfs_zstd_level || '1' }}"
-      SOONG_PROFILE_INTERVAL_SAMPLES: "360"  # 10s monitor x 360 = about 60 minutes
-      SOONG_PROFILE_TIMEOUT_SECONDS: "80"
-      # Conservative Btrfs-only pilot on stable byte-identical Java JARs.
-      # Duperemove preserves paths and file contents; never delete intermediates.
-      JAR_DEDUPE_MODE: "${{ inputs.jar_dedupe_mode || 'probe' }}"
-      JAR_DEDUPE_INTERVAL_SAMPLES: "360"  # probe about every 60 minutes
-      JAR_DEDUPE_AGE_MINUTES: "20"
-      JAR_DEDUPE_HASH_GIB: "2"          # bounded probe sampling; adaptive opt-in
-      JAR_DEDUPE_MAX_FILES: "350"
-      JAR_DEDUPE_MIN_FREE_GIB: "9"
 
       # Android / Soong RBE
       USE_RBE: "1"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
       RBE_CXX_EXEC_STRATEGY: "remote"
 
-      # Keep authenticated TLS via the existing loopback bridge; preserve the
-      # BuildBuddy API key outside the uploaded diagnostic directory.
-      # Forward plaintext h2c on loopback to a TLS-verified nginx gRPC proxy
-      # which attaches BuildBuddy's x-buildbuddy-api-key header.
+      # Loopback plaintext h2c -> nginx gRPC TLS proxy with BuildBuddy API key
       RBE_service: "127.0.0.1:19099"
       RBE_service_no_security: "true"
       RBE_service_no_auth: "true"
       RBE_use_application_default_credentials: "false"
       RBE_use_rpc_credentials: "false"
-      # Reclient 0.172 uses the matching standalone C/C++ dependency scanner.
-      # execrel:// resolves scandeps_server next to the pinned reproxy binary.
       RBE_depsscanner_address: "execrel://"
 
-      # Keep all RBE diagnostics in one place.
+      # Keep all RBE diagnostics in one place
       RBE_log_dir: "/tmp/rbe-test"
-      # No RBE_log_path: deprecated duplicate action log; proxy_log_dir is retained.
       RBE_proxy_log_dir: "/tmp/rbe-test"
       RBE_output_dir: "/tmp/rbe-test"
       RBE_reproxy_wait_seconds: "30"
       RBE_v: "0"
-      # RBE logs are written into the compressed workspace through /tmp/rbe-test.
-      # Keep provenance and clean older Git object packs only after graph generation.
+
+      # Reclaim Git object stores after graph generation
       SAFE_GIT_OBJECT_TRIM: "1"
-      # After recording a real revision-locked manifest, reclaim extra Git-only
-      # object stores; not the checked-out clang/misc toolchain files.
       SAFE_GIT_EXTENDED_TRIM: "1"
-      # Retain full RBE metrics and error tails; do not rotate a live reproxy FD.
       RBE_CLOSED_INFO_MAX_MIB: "32"
       RBE_LOG_SCAN_INTERVAL_SAMPLES: "6"
-      DISK_PROFILE_INTERVAL_SAMPLES: "30"
       RBE_INFO_KEEP_MIB: "4"
       RBE_RRPL_KEEP_MIB: "32"
 
-      # Android Soong uses remote Ninja concurrency independently of -j2.
-      # Keep the 2-job local pool, highmem pool=1; selectable 16/20/24 remote actions.
-      NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '20' }}"
+      # RBE & Ninja concurrency
+      NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
 
-      # Soong graph generation is local even with BuildBuddy RBE.
-      # Go GC is tuned for the standard ~16-GB GitHub runner.
-      # P0: GC target for the direct Go runtime patch in soong_build/main.go.
+      # Soong Go GC tuning for graph generation
       SOONG_GOGC: "45"
       SOONG_GOMEMLIMIT: "6GiB"
-      # Limit active Go workers during the memory-heavy graph generation only.
       SOONG_GRAPH_GOMAXPROCS: "2"
-      # Bootstrap Go helpers get gctrace where environment is inherited.
-      # Primary Soong telemetry comes from direct runtime.MemStats samples.
       SOONG_GRAPH_GC_TRACE: "1"
       SOONG_GRAPH_GC_TAIL_LINES: "200"
-      # Stop before RAM and disk swap are both exhausted. This protects the
-      # GitHub runner and preserves logs, but DOES NOT solve graph memory use.
       GRAPH_MEM_GUARD_ENABLED: "1"
       GRAPH_MEM_GUARD_RAM_MIB: "1024"
       GRAPH_MEM_GUARD_SWAP_MIB: "1536"
       GRAPH_MEM_GUARD_SAMPLES: "3"
-      # Hybrid graph memory: compressed RAM swap first, disk swap second.
-      # ZRAM is best-effort: GitHub runner kernels may not provide the module.
+
+      # Hybrid graph memory: ZRAM first, disk swap second
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       POST_GRAPH_DISK_SWAP_GIB: "4"
-      # Keep 12 GiB free after graph swap allocation where possible.
       SOONG_SWAP_DISK_RESERVE_GIB: "12"
 
-      # P1 storage trim: worktree-only, measured with df before/after.
-      # Preserve Linux toolchains and the API 33 reference ABI dumps used by this trim.
+      # P1 worktree storage trim
       STORAGE_TRIM_DARWIN_HOST_TOOLS: "1"
-      # Experimental: keep VNDK ABI versions 32, 33 and R; remove 29..31 only.
-      # Set to "0" to retain all VNDK reference dumps for stricter validation.
       STORAGE_TRIM_OLD_VNDK_ABI: "1"
 
-      # GiB of available disk space (statvfs/df -B1, not rounded df -h).
-      # Experimental 7-GiB floor requested for a deeper build trial.
-      # Never let the free space reach zero; packaging may still need more.
+      # Disk & time safety thresholds (348m leaves 12m buffer for artifact upload)
       DISK_WARN_GIB: "10"
       DISK_STOP_GIB: "1"
-      # Preserve time for post-build metrics and artifact upload; no guarantee
-      # the ~173k-Ninja-edge ROM fits within 6 hours even after optimization.
-      # Whole-job limit on GitHub-hosted runners: 360 minutes.
-      FULL_ROM_SOFT_DEADLINE_MINUTES: "360"
+      FULL_ROM_SOFT_DEADLINE_MINUTES: "348"
 
     steps:
       - name: Reclaim root disk
@@ -170,7 +122,11 @@ jobs:
           set -e
           sudo swapoff -a || true
           sudo rm -f /swapfile /build-swap /mnt/swapfile || true
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
           sudo rm -rf \
+            /var/lib/docker \
+            /var/lib/containerd \
+            /var/cache/apt/archives/* \
             /usr/local/lib/android \
             /usr/share/dotnet \
             /opt/ghc \
@@ -185,7 +141,6 @@ jobs:
             /usr/share/php* || true
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
-          # Start the total-job clock before dependency install and repo sync.
           date +%s > /tmp/rbe-test/job-start-epoch.txt
 
           echo "=== DISK ==="
@@ -195,8 +150,6 @@ jobs:
           echo "=== CPU ==="
           nproc
 
-          # Persist a clean-runner baseline before package installation/sync.
-          # No tokens or secrets are written to this log.
           TS=/tmp/rbe-test/resource-samples.tsv
           printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$TS"
           printf '%s\tpost-reclaim\t%s\t%s\t%s\n' \
@@ -256,12 +209,6 @@ jobs:
             openssl \
             unzip
 
-          # Optional storage experiment must not block the ROM toolchain.
-          if ! command -v duperemove >/dev/null 2>&1; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y duperemove \
-              || echo '::warning::duperemove unavailable; JAR scan remains read-only.'
-          fi
-
           mkdir -p "$HOME/bin"
           curl -fsSL \
             https://storage.googleapis.com/git-repo-downloads/repo \
@@ -278,9 +225,6 @@ jobs:
             exit 1
           fi
 
-      # A single filesystem for .repo, the entire Android source tree, prebuilts
-      # and out/. The sparse image is a LOGICAL cap, NOT extra physical storage.
-      # Root df, not inner Btrfs df, is the authoritative disk safety guard.
       - name: Mount compressed Btrfs ZSTD workspace before repo sync
         if: ${{ inputs.workspace_storage == 'btrfs_zstd' }}
         working-directory: /home/runner/work
@@ -294,7 +238,6 @@ jobs:
             echo '::error::Android workspace must be empty before Btrfs setup.'
             exit 1
           fi
-          # Never fallocate the image: physical blocks must grow on demand.
           truncate -s "${BTRFS_WORKSPACE_IMAGE_GIB}G" "$BACKING"
           sudo mkfs.btrfs -f -m single -d single "$BACKING" \
             > /tmp/rbe-test/btrfs-mkfs.log 2>&1
@@ -320,9 +263,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # RBE uses /tmp/rbe-test internally. Place its backing directory under
-          # the existing compressed Btrfs workspace so INFO/rrpl do not fill /tmp.
-          # Also works in plain mode; the reduction is compression-dependent.
           DST=/home/runner/work/los/rbe-diagnostics
           test -d /home/runner/work/los
           mkdir -p "$DST"
@@ -335,7 +275,6 @@ jobs:
             ln -s "$DST" /tmp/rbe-test
           fi
           echo "diagnostic_realpath=$(readlink -f /tmp/rbe-test)" > /tmp/rbe-test/diagnostic-location.txt
-          # Check physical location, not du on the /tmp symlink (which yields 0).
           REAL_DIAG="$(readlink -f /tmp/rbe-test)"
           test "$REAL_DIAG" = "$DST"
           echo "diag_bytes=$(du -sk "$REAL_DIAG" | awk '{print $1*1024}')"
@@ -352,7 +291,6 @@ jobs:
           git config --global user.email "ci@local"
           git config --global user.name "ci"
           git config --global color.ui false
-          # Initialize filters BEFORE repo sync; LineageOS WebView uses Git LFS.
           git lfs version
           git lfs install --skip-repo
 
@@ -381,10 +319,6 @@ jobs:
 
           cp "$MANIFEST_SRC" "$MANIFEST_DST"
 
-          # P0: remove the oversized multi-version reclient checkout BEFORE sync.
-          # -a is required because no worktree has been checked out yet.
-          # The pinned toolchain is fetched separately after sync and must be
-          # self-contained. Never remove other Android prebuilts here.
           echo "=== P0 RECLIENT PROJECT BEFORE TRIM ==="
           repo list -a -p > /tmp/rbe-test/manifest-projects-before-trim.txt
           if ! grep -Fxq 'prebuilts/remoteexecution-client' \
@@ -393,8 +327,6 @@ jobs:
             exit 1
           fi
 
-          # Discover actual manifest project names, never assume name=path.
-          # Only remove the explicit Linux-irrelevant host entries, if present.
           repo manifest -o /tmp/rbe-test/pre-storage-trim-manifest.xml
           python3 - <<'PYHOSTTRIM'
           from pathlib import Path
@@ -520,11 +452,6 @@ jobs:
           PYLOCK
           sha256sum "$FILE" > /tmp/rbe-test/source-manifest-locked.sha256
 
-      # Collect post-sync storage attribution while the tree is still clean.
-      # This is diagnostic-only and does not mutate .repo, source, or out.
-      # Prevent a tiny LFS pointer from reaching veridex as an invalid APK.
-      # Some Lineage trees have WebView inside a parent Git project; resolve
-      # the repository root before applying the LFS include path.
       - name: Sonivox ARM preflight and narrowly guarded source fix
         working-directory: /home/runner/work/los
         shell: bash
@@ -541,14 +468,11 @@ jobs:
           test -x "$CLANG"
           echo '=== SONIVOX SOURCE CHECK, LINE 70-115 ==='
           nl -ba "$INC" | sed -n '70,115p'
-          # This is deliberately a *single* syntax repair. Do not rewrite
-          # all assembler conditionals or disable dependency scanning globally.
           python3 - "$INC" <<'PYSONIVOX'
           from pathlib import Path
           import sys, re, difflib
           path = Path(sys.argv[1]); orig = path.read_text()
           lines = orig.splitlines(keepends=True)
-          # Track CPP conditional depth; assembler .if/.endif are distinct.
           depth = 0; orphans = []
           for i, line in enumerate(lines):
               if re.match(r'^\s*#\s*(?:if|ifdef|ifndef)\b',line):
@@ -560,14 +484,11 @@ jobs:
           if not orphans:
               print('No unmatched #endif; no patch needed')
               sys.exit(0)
-          # Apply only the known reported location and only if its corresponding
-          # assembler conditional is visible in this same source section.
           if len(orphans) != 1 or orphans[0] != 97:
               sys.exit('Unexpected Sonivox CPP imbalance; refuse speculative patch')
           i = orphans[0]
           if not re.fullmatch(r'\s*#\s*endif\s*(?:\r?\n)?',lines[i]):
               sys.exit('Unexpected line 98 content; refusing patch')
-          # Assembler .if uses --defsym values; the closing line must be .endif.
           if not any(re.match(r'^\s*\.if\b',lines[j]) for j in range(max(0,i-60),i)):
               sys.exit('No nearby assembler .if to match; refusing patch')
           lines[i] = re.sub(r'#\s*endif', '.endif', lines[i], count=1)
@@ -577,13 +498,14 @@ jobs:
           path.write_text(repaired)
           PYSONIVOX
           echo '=== REAL CLANG CPP VALIDATION ==='
-          # Preprocessor path matches -xassembler-with-cpp; use the same source
-          # files and include tree as the failing ARM objects.
           for name in ARM-E_filter_gnu ARM-E_mastergain_gnu; do
-            "$CLANG" -E -x assembler-with-cpp -target armv7a-linux-androideabi10000               -I"$SRC" "$SRC/$name.s"               -o "/tmp/rbe-test/${name}.preprocessed.s"
+            "$CLANG" -E -x assembler-with-cpp -target armv7a-linux-androideabi10000 \
+              -I"$SRC" "$SRC/$name.s" \
+              -o "/tmp/rbe-test/${name}.preprocessed.s"
             test -s "/tmp/rbe-test/${name}.preprocessed.s"
           done
-          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc             > /tmp/rbe-test/sonivox-fix.patch || true
+          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc \
+            > /tmp/rbe-test/sonivox-fix.patch || true
           echo 'SONIVOX_CPP_PREFLIGHT_PASSED'
 
       - name: Resolve and validate Chromium WebView arm64 Git LFS
@@ -603,8 +525,6 @@ jobs:
             repo list -a -p | grep -E '^external/chromium-webview(/|$)' || true
           } | tee "$LOG"
 
-          # Some manifests don't contain this prebuilt at this exact path.
-          # Do not invent/download an APK from another branch in that case.
           if [ ! -e "$APK" ]; then
             if repo list -a -p | grep -Fxq "$DIR"; then
               echo "::error::WebView arm64 project exists, but APK missing: $APK" | tee -a "$LOG"
@@ -671,7 +591,7 @@ jobs:
       - name: Profile storage after repo sync
         if: success()
         working-directory: /home/runner/work/los
-        timeout-minutes: 20
+        timeout-minutes: 5
         shell: bash
         run: |
           set -uo pipefail
@@ -681,111 +601,18 @@ jobs:
           if [ ! -s "$TS" ]; then
             printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$TS"
           fi
-
-          sample() {
-            local stage="$1" available used mem
-            available="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
-            used="$(df -B1 --output=used "$PWD" | tail -n 1 | tr -d ' ')"
-            mem="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-            printf '%s\t%s\t%s\t%s\t%s\n' \
-              "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$stage" "$available" "$used" "$mem" >> "$TS"
-          }
-          sample post-sync
-
+          available="$(df -B1 --output=avail "$PWD" | tail -n 1 | tr -d ' ')"
+          used="$(df -B1 --output=used "$PWD" | tail -n 1 | tr -d ' ')"
+          mem="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          printf '%s\tpost-sync\t%s\t%s\t%s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$available" "$used" "$mem" >> "$TS"
           {
-            echo '=== POST-SYNC DISK ANALYSIS ==='
+            echo '=== POST-SYNC DISK ANALYSIS (FAST) ==='
             date -u +'%Y-%m-%dT%H:%M:%SZ'
-            echo '=== MOUNT POINTS ==='
             df -hT / /mnt /home/runner/work/los
-            echo '=== BLOCK DEVICES ==='
-            lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
-            echo '=== INODES ==='
-            df -i /home/runner/work/los
-            echo '=== GIT OBJECT STORAGE ==='
-            du -sh .repo 2>/dev/null || true
-            echo '=== OUTPUT TREE ==='
-            du -sh out 2>/dev/null || true
-            echo '=== SOURCE TREE - FIRST LEVEL ==='
-            du -xhd1 . 2>/dev/null | sort -h | tail -n 50 || true
-            echo '=== RUNNER SYSTEM FOOTPRINT ==='
-            # Avoid scanning /home/runner/work twice (large Android checkout).
-            sudo du -xhd1 /opt /usr/local /var 2>/dev/null | sort -h | tail -n 35 || true
-            du -sh /home/runner/.cache /home/runner/.local /home/runner/.cargo \
-              2>/dev/null || true
-            echo '=== MEMORY ==='
             free -h
-            echo '=== AVAILABLE DISK (BYTES) ==='
-            df -B1 --output=source,size,used,avail,pcent,target /home/runner/work/los
           } 2>&1 | tee "$LOG"
 
-          # Detail the largest checked-out prebuilts and repo metadata.
-          # Diagnostic-only: never delete, prune, or mutate Android sources.
-          echo '=== PREBUILTS STORAGE BREAKDOWN ==='
-          if [ -d prebuilts ]; then
-            du -xhd1 prebuilts 2>/dev/null | sort -h \
-              > /tmp/rbe-test/prebuilts-size.log || true
-            du -xhd2 prebuilts 2>/dev/null | sort -h \
-              > /tmp/rbe-test/prebuilts-detail.log || true
-            echo '--- PREBUILTS LEVEL 1 ---'
-            tail -n 60 /tmp/rbe-test/prebuilts-size.log || true
-            echo '--- PREBUILTS LEVEL 2 (LARGEST 80) ---'
-            tail -n 80 /tmp/rbe-test/prebuilts-detail.log || true
-          else
-            echo '::warning::prebuilts directory was not found.'
-          fi
-
-          echo '=== REPO METADATA STORAGE BREAKDOWN ==='
-          if [ -d .repo ]; then
-            du -xhd2 .repo 2>/dev/null | sort -h \
-              > /tmp/rbe-test/repo-size.log || true
-            echo '--- REPO METADATA (LARGEST 40) ---'
-            tail -n 40 /tmp/rbe-test/repo-size.log || true
-          else
-            echo '::warning::.repo directory was not found.'
-          fi
-          # Deep-dive into the largest storage groups from previous runs.
-          # Never delete source, prebuilts, .repo objects, or installed tools.
-          echo '=== CLANG TOOLCHAIN VERSION BREAKDOWN ==='
-          if [ -d prebuilts/clang ]; then
-            du -xhd4 prebuilts/clang 2>/dev/null | sort -h \
-              > /tmp/rbe-test/clang-detail.log || true
-            echo '--- CLANG LARGEST 35 ---'
-            tail -n 35 /tmp/rbe-test/clang-detail.log || true
-            find prebuilts/clang/host -mindepth 2 -maxdepth 2 \
-              -type d -name 'clang-*' -print 2>/dev/null | sort \
-              > /tmp/rbe-test/clang-versions.log || true
-          else
-            echo '::warning::prebuilts/clang missing'
-          fi
-
-          echo '=== GRADLE PLUGIN BREAKDOWN ==='
-          if [ -d prebuilts/gradle-plugin ]; then
-            du -xhd4 prebuilts/gradle-plugin 2>/dev/null | sort -h \
-              > /tmp/rbe-test/gradle-detail.log || true
-            tail -n 25 /tmp/rbe-test/gradle-detail.log || true
-          fi
-
-          echo '=== PLATFORM GIT OBJECT BREAKDOWN ==='
-          if [ -d .repo/project-objects/platform ]; then
-            du -xhd4 .repo/project-objects/platform 2>/dev/null | sort -h \
-              > /tmp/rbe-test/platform-objects-detail.log || true
-            tail -n 35 /tmp/rbe-test/platform-objects-detail.log || true
-          fi
-
-          echo '=== MANIFEST PREBUILTS PROJECT PATHS ==='
-          # A candidate inventory only: NEVER change the synced manifest.
-          repo list -p 2> /tmp/rbe-test/prebuilts-projects-errors.log \
-            | grep -E '^prebuilts(/|$)' \
-            > /tmp/rbe-test/prebuilts-projects.log || true
-          echo "Registered prebuilts projects: $(wc -l < /tmp/rbe-test/prebuilts-projects.log)"
-          sed -n '1,120p' /tmp/rbe-test/prebuilts-projects.log || true
-          sample post-deep-storage-profile
-
-          echo '=== DEEP STORAGE BASELINE COMPLETE ==='
-
-      # P1: remove only unwanted host-platform binaries and historical
-      # ABI reference dumps from checked-out worktrees. This DOES NOT reclaim
-      # packed objects in .repo/project-objects: they remain for this run.
       - name: P1 reclaim unused Darwin binaries and historical VNDK ABI worktrees
         if: success()
         working-directory: /home/runner/work/los
@@ -806,7 +633,6 @@ jobs:
           before_bytes="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
           echo "disk_available_before_bytes=$before_bytes"
 
-          # Whitelist protects source and vendor trees from dynamic path input.
           trim_known_path() {
             local rel="$1" kib=0
             case "$rel" in
@@ -838,7 +664,6 @@ jobs:
           }
 
           if [ "${STORAGE_TRIM_DARWIN_HOST_TOOLS}" = 1 ]; then
-            # Abort the Linux-host trim if the Rust Linux toolchain is absent.
             if [ -d prebuilts/rust/linux-x86 ] && [ -d prebuilts/clang/host/linux-x86 ]; then
               for rel in \
                 prebuilts/rust/darwin-x86 \
@@ -856,9 +681,6 @@ jobs:
           fi
 
           if [ "${STORAGE_TRIM_OLD_VNDK_ABI}" = 1 ]; then
-            # This storage-trim heuristic retains API/VNDK 33; keep 32 as
-            # compatibility headroom, plus 33, R, files at repository root.
-            # Do not remove the abi-dumps project or disable ABI checks.
             root=prebuilts/abi-dumps/vndk
             if [ ! -L "$root" ] && [ -s "$root/Android.bp" ] \
                && [ -d "$root/32" ] && [ -d "$root/33" ]; then
@@ -874,7 +696,6 @@ jobs:
             fi
           fi
 
-          # Strict post-checks for the host toolchain and current ABI reference.
           test -d prebuilts/rust/linux-x86
           test -d prebuilts/clang/host/linux-x86
           test -d prebuilts/abi-dumps/vndk/33
@@ -886,16 +707,12 @@ jobs:
           echo "disk_available_delta_bytes=$reclaimed_bytes"
           df -h "$PWD"
           cat "$TABLE"
-          if (( reclaimed_bytes < 0 )); then
-            echo '::warning::Net free space decreased during trim; check concurrent processes.'
-          fi
           if [ -s "$TS" ]; then
             printf '%s\tpost-worktree-trim\t%s\t%s\t%s\n' \
               "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$after_bytes" \
               "$(df -B1 --output=used "$PWD" | tail -n1 | tr -d ' ')" \
               "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" >> "$TS"
           fi
-          echo 'P1 trim changes the checkout only, not .repo Git object packs.'
 
       - name: Verify star2lte product registration
         working-directory: /home/runner/work/los
@@ -904,7 +721,6 @@ jobs:
           set -eo pipefail
 
           echo "=== PRODUCT REGISTRATION ==="
-
           MATCHES="$(
             grep -R -l \
               --include='AndroidProducts.mk' \
@@ -914,22 +730,12 @@ jobs:
 
           if [ -z "$MATCHES" ]; then
             echo "::error::Could not find lineage_star2lte in any AndroidProducts.mk."
-            echo "The local manifest did not sync/register the star2lte product correctly."
             find device vendor -maxdepth 4 -name AndroidProducts.mk -print 2>/dev/null | head -100 || true
             exit 1
           fi
 
           printf '%s\n' "$MATCHES"
 
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            echo "--- $file"
-            sed -n '1,180p' "$file"
-          done <<< "$MATCHES"
-
-      # Fail fast when the checkout does not expose Android 14 AP2A.
-      # This is the release configured by LineageOS/android_build_release,
-      # lineage-21.0; check the actual synced source rather than guessing.
       - name: Verify LineageOS 21 release AP2A
         working-directory: /home/runner/work/los
         shell: bash
@@ -946,20 +752,7 @@ jobs:
           fi
           echo '=== LINEAGEOS 21.0 AP2A RELEASE CONFIG VERIFIED ==='
 
-      # AOSP reclient 0.172 with matching scandeps_server, pinned to one commit.
-      # Keep repo-sync trim: only the single known-good live snapshot is fetched.
-      # Ubuntu 24.04 ships ncurses6; legacy RenderScript Clang needs ncurses5.
-      # Use the matching Jammy security packages, pinned with checksums from
-      # packages.ubuntu.com, instead of making unsafe SONAME symlinks.
-
-      # P0/P1: AOSP launches the main graph tool via `env -i`. Go environment
-      # exports from GitHub Actions therefore do not reliably reach it.
-      # Apply GC controls inside the real `soong_build` process instead.
-      # No file mutation of .o/.a/.so while Ninja is running. The official
-      # CLANG_DEFAULT_DEBUG_LEVEL is implemented in build/soong/cc/config/global.go.
-      # A small preflight checks the actual Clang toolchain and writes a profiler
-      # for bounded, read-only sampling later in the build.
-      - name: Validate DWARF size optimization and install Soong profiler
+      - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -974,295 +767,10 @@ jobs:
             echo '::error::Checked-out Soong does not implement CLANG_DEFAULT_DEBUG_LEVEL'
             exit 1
           fi
-          CLANG=prebuilts/clang/host/linux-x86/clang-r510928/bin/clang++
-          test -x "$CLANG"
           echo "debug_info_level=$CLANG_DEFAULT_DEBUG_LEVEL" > /tmp/rbe-test/dwarf-config.txt
           echo "remote_jobs=$NINJA_REMOTE_NUM_JOBS" >> /tmp/rbe-test/dwarf-config.txt
           echo "btrfs_zstd_level=$BTRFS_ZSTD_LEVEL" >> /tmp/rbe-test/dwarf-config.txt
-          echo "profile_interval_samples=$SOONG_PROFILE_INTERVAL_SAMPLES" >> /tmp/rbe-test/dwarf-config.txt
-          # This is an illustrative microbenchmark, not a 30 GiB savings claim.
-          cat > /tmp/rbe-test/ci-dwarf-probe.cpp <<'CPPSAMPLE'
-          template <typename T, int N> struct Chunk { T data[N]; int get(int i) const { return data[i%N]; } };
-          template <int N> int calculate(int x) { Chunk<int,N> c{}; for (int i=0;i<N;i++) c.data[i]=i*x; return c.get(x); }
-          extern "C" int probe(int x) { return calculate<97>(x)+calculate<197>(x)+calculate<397>(x); }
-          CPPSAMPLE
-          printf 'preset\tobject_bytes\n' > /tmp/rbe-test/dwarf-preflight.tsv
-          for spec in full:-g minimal:-g1 none:-g0; do
-            preset="${spec%%:*}"
-            flag="${spec#*:}"
-            obj="/tmp/rbe-test/ci-dwarf-${preset}.o"
-            "$CLANG" -c -O2 "$flag" -gz=zstd -fdebug-default-version=5 \
-              /tmp/rbe-test/ci-dwarf-probe.cpp -o "$obj"
-            printf '%s\t%s\n' "$preset" "$(stat -c %s "$obj")" >> /tmp/rbe-test/dwarf-preflight.tsv
-          done
-          cat /tmp/rbe-test/dwarf-preflight.tsv
-          cat > /tmp/rbe-test/soong_storage_probe.py <<'PYPROFILE'
-          #!/usr/bin/env python3
-          # Read-only / bounded-memory measurement of Soong intermediates.
-          import collections, datetime, heapq, os, pathlib, sys, time
-          root=pathlib.Path(sys.argv[1]); dest=pathlib.Path(sys.argv[2]); stage=sys.argv[3]
-          dest.mkdir(parents=True,exist_ok=True)
-          if not root.is_dir():
-              print('SOONG_PROFILE_SKIPPED: intermediate directory missing'); sys.exit(0)
-          by_type=collections.defaultdict(lambda:[0,0,0])
-          by_module=collections.defaultdict(lambda:[0,0,0])
-          by_area=collections.defaultdict(lambda:[0,0,0])
-          top=[]; stack=[root]; files=0; total=0; allocated=0; start=time.monotonic()
-          def update(agg,key,sz,bl):
-              value=agg[key];value[0]+=1;value[1]+=sz;value[2]+=bl
-          while stack:
-              current=stack.pop()
-              try:
-                  with os.scandir(current) as it:
-                      for ent in it:
-                          try:
-                              if ent.is_symlink(): continue
-                              if ent.is_dir(follow_symlinks=False): stack.append(ent.path);continue
-                              if not ent.is_file(follow_symlinks=False): continue
-                              st=ent.stat(follow_symlinks=False)
-                          except (OSError,ValueError):continue
-                          rel=os.path.relpath(ent.path,root)
-                          parts=rel.split(os.sep)
-                          ext=pathlib.Path(ent.name).suffix.lower() or '[no extension]'
-                          if ext not in ('.o','.a','.so','.jar','.dex','.vdex','.apk','.zip','.bc','.rsp','.d','.json','.ninja','.txt','.xml','.bin'):
-                              ext='[other]'
-                          sz=st.st_size;bl=st.st_blocks*512
-                          update(by_type,ext,sz,bl)
-                          update(by_area,parts[0] if parts else '[root]',sz,bl)
-                          index=next((i for i,p in enumerate(parts) if p.startswith(('android_','linux_','darwin_'))),None)
-                          module='/'.join(parts[:index]) if index and index>0 else '/'.join(parts[:min(len(parts),4)])
-                          update(by_module,module,sz,bl)
-                          total+=sz;allocated+=bl;files+=1
-                          item=(sz,rel,bl)
-                          if len(top)<60:heapq.heappush(top,item)
-                          elif sz>top[0][0]:heapq.heapreplace(top,item)
-              except (OSError,PermissionError):pass
-          timestamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-          def report(name,table,limit):
-              p=dest/name
-              with p.open('w') as f:
-                  f.write('key\tfiles\tlogical_bytes\tst_blocks_bytes\n')
-                  for key,(count,size,block) in sorted(table.items(),key=lambda x:x[1][1],reverse=True)[:limit]:
-                      f.write(f'{key}\t{count}\t{size}\t{block}\n')
-          report('soong-size-by-type.tsv',by_type,40)
-          report('soong-size-by-area.tsv',by_area,50)
-          report('soong-size-by-module.tsv',by_module,150)
-          with (dest/'soong-largest-files.tsv').open('w') as f:
-              f.write('logical_bytes\tst_blocks_bytes\tpath\n')
-              for sz,rel,bl in sorted(top,reverse=True):f.write(f'{sz}\t{bl}\t{rel}\n')
-          with (dest/'soong-profile-history.tsv').open('a') as f:
-              f.write(f'{timestamp}\t{stage}\t{files}\t{total}\t{allocated}\t{time.monotonic()-start:.1f}\n')
-          print(f'SOONG_PROFILE stage={stage} files={files} logical_gib={total/2**30:.2f} allocated_est_gib={allocated/2**30:.2f}')
-          PYPROFILE
-          python3 -m py_compile /tmp/rbe-test/soong_storage_probe.py
-          echo 'SOONG_STORAGE_PROFILER_READY'
-
-      - name: Install guarded Soong JAR dedupe analyzer
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$JAR_DEDUPE_MODE" in off|probe|adaptive) ;; *) exit 1 ;; esac
-          if [ "$JAR_DEDUPE_MODE" = adaptive ] && [ "$WORKSPACE_STORAGE" != btrfs_zstd ]; then
-            echo '::notice::Plain workspace selected; apply mode will automatically use read-only scan.'
-          fi
-          # This is a SHA-256 exact-file pilot, not global block-level dedupe.
-          # No files are removed, renamed, modified, or reflink-replaced.
-          cat > /tmp/rbe-test/ci_jar_dedupe.py <<'PY_JAR_DEDUPE'
-          #!/usr/bin/env python3
-          """Bounded, conservative CI probe/dedupe for byte-identical stable Soong JARs.
-          No deletes, no file replacement, and no fstrim on root.  Conservative pilots only.
-          """
-          import argparse
-          import collections
-          import datetime
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import shutil
-          import subprocess
-          import sys
-          import time
-          import zipfile
-          
-          GIB=1<<30
-          MIB=1<<20
-          
-          def physical(path):
-              try:
-                  st=os.stat(path)
-                  return st.st_blocks*512
-              except OSError:
-                  return -1
-          
-          def host_free():
-              st=os.statvfs('/')
-              return st.f_bavail*st.f_frsize
-          
-          def timestamp():
-              return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-          
-          def write_tsv(path, header, rows):
-              with path.open('w') as f:
-                  f.write('\t'.join(header)+'\n')
-                  for row in rows:
-                      f.write('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in row)+'\n')
-          
-          def census(root, min_bytes, max_bytes, stable_age):
-              now=time.time()
-              by_size=collections.defaultdict(list)
-              total=0; count=0; stable_total=0; stable_count=0
-              inode_seen=set()
-              for base, dirs, files in os.walk(root,followlinks=False):
-                  for name in files:
-                      if not name.endswith('.jar'):continue
-                      path=Path(base)/name
-                      try:
-                          st=path.lstat()
-                          if not path.is_file() or path.is_symlink():continue
-                      except OSError: continue
-                      total+=st.st_size; count+=1
-                      if st.st_size < min_bytes or st.st_size > max_bytes:continue
-                      if now-st.st_mtime < stable_age:continue
-                      identity=(st.st_dev,st.st_ino)
-                      if identity in inode_seen:continue
-                      inode_seen.add(identity)
-                      stable_total+=st.st_size; stable_count+=1
-                      by_size[st.st_size].append((path,st))
-              return by_size, (total,count,stable_total,stable_count)
-          
-          def sha256_checked(path, old):
-              h=hashlib.sha256()
-              try:
-                  with path.open('rb') as f:
-                      first=os.fstat(f.fileno())
-                      if (first.st_size,first.st_mtime_ns,first.st_ino)!=(old.st_size,old.st_mtime_ns,old.st_ino): return None
-                      while True:
-                          buf=f.read(MIB)
-                          if not buf:break
-                          h.update(buf)
-                      last=os.fstat(f.fileno())
-                      if (last.st_size,last.st_mtime_ns,last.st_ino)!=(old.st_size,old.st_mtime_ns,old.st_ino): return None
-                  return h.hexdigest()
-              except (OSError,ValueError): return None
-          
-          def main():
-              p=argparse.ArgumentParser()
-              p.add_argument('--root',type=Path,required=True)
-              p.add_argument('--diagnostics',type=Path,required=True)
-              p.add_argument('--mode',choices=['off','probe','adaptive'],required=True)
-              p.add_argument('--age-minutes',type=int,default=20)
-              p.add_argument('--hash-gib',type=float,default=3)
-              p.add_argument('--max-files',type=int,default=350)
-              p.add_argument('--zip-samples',type=int,default=40)
-              p.add_argument('--backing',type=Path,default=Path('/tmp/los20-workspace-btrfs.img'))
-              p.add_argument('--min-host-gib',type=float,default=9)
-              a=p.parse_args()
-              out=a.diagnostics;out.mkdir(parents=True,exist_ok=True)
-              state_path=out/'jar-dedupe-state.json'
-              summary_file=out/'jar-dedupe-runs.tsv'
-              if not summary_file.exists():
-                  summary_file.write_text('timestamp\tmode\tfs\tjar_count\tjar_total_bytes\tstable_count\tsame_size_candidate_upper_bytes\tsha_hashed_bytes\tsha_hashed_files\tverified_duplicate_files\tverified_duplicate_bytes\tselected_for_dedupe_bytes\tduperemove_rc\thost_free_before\thost_free_after\tbacking_blocks_before\tbacking_blocks_after\tnote\n')
-              if a.mode=='off':return 0
-              if not a.root.is_dir():
-                  print('JAR_DEDUPE_SKIP: no Soong intermediates');return 0
-              fs=subprocess.run(['stat','-f','-c','%T',str(a.root)],capture_output=True,text=True,check=False).stdout.strip()
-              state={}
-              if state_path.exists():
-                  try:state=json.loads(state_path.read_text())
-                  except (ValueError,OSError):pass
-              promoted=bool(state.get('promoted'))
-              byte_budget=int(a.hash_gib*GIB*(2 if promoted else 1))
-              before=host_free(); backing_before=physical(a.backing)
-              by_size, (total,count,stable_total,stable_count)=census(a.root,128*1024,128*MIB,a.age_minutes*60)
-              groups=[(size,entries) for size,entries in by_size.items() if len(entries)>1]
-              candidates=sum(size*(len(entries)-1) for size,entries in groups)
-              # Prioritize maximum possible savings per candidate reading cost.
-              groups.sort(key=lambda g:(g[0]*(len(g[1])-1),g[0]),reverse=True)
-              inventory=[(size,len(entries),size*(len(entries)-1)) for size,entries in groups]
-              write_tsv(out/'jar-same-size-groups.tsv',('jar_size','files','unverified_upper_bound_bytes'),inventory[:200])
-              hashed=0; hashed_count=0
-              verified=[]
-              duplicate_bytes=0; duplicate_files=0
-              for size, entries in groups:
-                  if hashed+len(entries)*size>byte_budget or hashed_count+len(entries)>a.max_files:
-                      continue
-                  digests=collections.defaultdict(list)
-                  for path,st in entries:
-                      digest=sha256_checked(path,st)
-                      if digest is not None:digests[digest].append((path,st))
-                      hashed+=size;hashed_count+=1
-                  for digest,same in digests.items():
-                      if len(same)<2:continue
-                      verified.append((size,digest,same))
-                      duplicate_files+=len(same)-1
-                      duplicate_bytes+=size*(len(same)-1)
-              write_tsv(out/'jar-sha256-duplicates.tsv',('sha256','file_bytes','group_files','logical_duplicate_bytes','paths'),
-                        [(d,size,len(same),size*(len(same)-1),' ; '.join(str(x[0].relative_to(a.root)) for x in same)) for size,d,same in verified[:200]])
-              zip_rows=[]
-              sample_paths=[]
-              for size, entries in sorted(by_size.items(),reverse=True):
-                  for path,st in entries:
-                      sample_paths.append((size,path))
-                      if len(sample_paths)>=a.zip_samples:break
-                  if len(sample_paths)>=a.zip_samples:break
-              for size,path in sample_paths:
-                  try:
-                      with zipfile.ZipFile(path) as z:
-                          entries=z.infolist()
-                          stored=sum(x.file_size for x in entries if x.compress_type==zipfile.ZIP_STORED)
-                          compressed=sum(x.compress_size for x in entries if x.compress_type!=zipfile.ZIP_STORED)
-                          methods=','.join(map(str,sorted(set(x.compress_type for x in entries))))
-                          zip_rows.append((path.relative_to(a.root),size,len(entries),stored,compressed,methods))
-                  except (OSError,zipfile.BadZipFile,ValueError):pass
-              write_tsv(out/'jar-zip-structure.tsv',('jar','jar_bytes','entries','stored_entry_bytes','compressed_entry_bytes','methods'),zip_rows)
-              rc='skip'; selected_bytes=0;note='read_only'
-              if a.mode=='adaptive':
-                  if fs!='btrfs':note='not_btrfs'
-                  elif not shutil.which('duperemove'):note='duperemove_not_installed'
-                  elif before<a.min_host_gib*GIB:note='low_host_space_skip_io'
-                  elif not verified:note='no_verified_identical_jars_in_sample'
-                  else:
-                      # Never run against files changed during hashing or young outputs.
-                      chosen=[]
-                      for size,digest,files in verified:
-                          unchanged=[]
-                          for path,st in files:
-                              try:
-                                  curr=path.stat()
-                                  if (curr.st_size,curr.st_mtime_ns,curr.st_ino)==(st.st_size,st.st_mtime_ns,st.st_ino):unchanged.append(str(path.resolve()))
-                              except OSError:pass
-                          if len(unchanged)>=2:chosen.extend(unchanged)
-                      selected_bytes=sum(Path(x).stat().st_size for x in chosen)
-                      if chosen:
-                          args=['duperemove','-d','--io-threads=1','--cpu-threads=1',
-                                '--hashfile='+str(out/'jar-duperemove.hash.db')]+chosen
-                          # Outer shell controls total wall clock and I/O priority.
-                          try:
-                              res=subprocess.run(args, stdout=subprocess.PIPE,stderr=subprocess.STDOUT, timeout=90,text=True,errors='replace')
-                              rc=str(res.returncode);note='dedupe_completed' if res.returncode==0 else 'duperemove_error'
-                              (out/'jar-duperemove-last.log').write_text(res.stdout[-12000:])
-                          except subprocess.TimeoutExpired as e:
-                              rc='timeout';note='duperemove_timeout'
-                      else:note='verified_files_became_active'
-              after=host_free();backing_after=physical(a.backing)
-              # Concurrent Ninja writes can hide actual savings; record BOTH raw deltas.
-              if a.mode=='adaptive' and rc=='0' and (after-before)>=64*MIB:
-                  state['promoted']=True
-              state['last_run']=timestamp();state['last_note']=note
-              state_path.write_text(json.dumps(state,indent=2)+'\n')
-              with summary_file.open('a') as f:
-                  values=[timestamp(),a.mode,fs,count,total,stable_count,candidates,hashed,hashed_count,duplicate_files,duplicate_bytes,selected_bytes,rc,before,after,backing_before,backing_after,note]
-                  f.write('\t'.join(str(v) for v in values)+'\n')
-              print(f'JAR_DEDUPE mode={a.mode} fs={fs} jars={count} logical_gib={total/GIB:.2f} same_size_upper_gib={candidates/GIB:.2f} sha_duplicate_gib={duplicate_bytes/GIB:.2f} selected_gib={selected_bytes/GIB:.2f} host_delta_gib={(after-before)/GIB:.2f} backing_delta_gib={(backing_before-backing_after)/GIB:.2f} note={note}')
-              return 0
-          
-          if __name__=='__main__': sys.exit(main())
-          PY_JAR_DEDUPE
-          python3 -m py_compile /tmp/rbe-test/ci_jar_dedupe.py
-          command -v duperemove || true
-          echo "JAR_DEDUPE_ANALYZER_READY mode=$JAR_DEDUPE_MODE"
+          echo 'DWARF_CONFIG_READY'
 
       - name: Configure primary Soong Go runtime and heap telemetry
         working-directory: /home/runner/work/los
@@ -1293,8 +801,6 @@ jobs:
           if not mem or not (1 <= gogc <= 200 and 1 <= maxprocs <= 16):
               sys.exit('ERROR: invalid GC settings')
           mem_bytes = int(mem.group(1)) * 1024**3
-          if not (1024**3 <= mem_bytes <= 64*1024**3):
-              sys.exit('ERROR: unreasonable soft memory limit')
 
           before = target.read_text()
           if before.count('func main() {') != 1 or before.count('import (') != 1:
@@ -1305,11 +811,7 @@ jobs:
               if f'"{imp}"' not in before:
                   before = before.replace('import (', f'import (\n    "{imp}"', 1)
 
-          # Apply tuning after flag.Parse and before expensive graph work.
-          # The process is started with an empty environment by design.
-          # The exporter samples genuine Go heap, not RSS or VmSwap.
           code = fr"""
-          // SOONG_GC_CI_TRIAL: only applies to primary --soong_variables graph.
           func configureSoongGraphRuntimeCI() {{
               graph := false
               for _, arg := range os.Args[1:] {{
@@ -1347,20 +849,13 @@ jobs:
           }}
           """
           injected = before.replace('func main() {', code + '\nfunc main() {', 1)
-          # Configure before parsing/building the graph; flag.Parse is cheap.
           injected = injected.replace('func main() {', 'func main() {\n    configureSoongGraphRuntimeCI()', 1)
           if injected.count('SOONG_GO_RUNTIME_APPLIED') != 1:
               sys.exit('ERROR: failed to inject runtime instrumentation')
           target.write_text(injected)
           subprocess.run([str(gofmt), '-w', str(target)], check=True)
-          formatted = target.read_text()
-          if formatted.count('SOONG_GO_RUNTIME_APPLIED') != 1:
-              sys.exit('ERROR: formatted Go source missing instrumentation')
           log.write_text(f'go_version={version}\nsource={target}\n' +
-                         f'GOGC={gogc}\nGOMEMLIMIT={mem_bytes}B\nGOMAXPROCS={maxprocs}\n' +
-                         'method=runtime.GOMAXPROCS + debug.SetGCPercent + debug.SetMemoryLimit\n' +
-                         'telemetry=/tmp/rbe-test/soong-go-heap.tsv (10 second intervals)\n' +
-                         'applies_only_to=primary_graph_with_--soong_variables\n')
+                         f'GOGC={gogc}\nGOMEMLIMIT={mem_bytes}B\nGOMAXPROCS={maxprocs}\n')
           print(log.read_text())
           PYGO
 
@@ -1378,7 +873,6 @@ jobs:
           BASE=https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses
           PKG_DIR="$RUNNER_TEMP/ncurses5-jammy"
           mkdir -p "$PKG_DIR"
-          # SHA256 hashes published by Ubuntu for the amd64 .deb files.
           NCURSES_SHA=58da01991712c6856af0658dc5e9cb533c1a6854ab950055ade185e35bc9c276
           TINFO_SHA=4df4288404108f1a156d014e8764a064e977e34e6d44931ab60451694c03c90d
 
@@ -1395,15 +889,11 @@ jobs:
             "$TINFO_SHA" "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" \
             "$NCURSES_SHA" "$PKG_DIR/libncurses5_${VERSION}_amd64.deb" \
             | sha256sum --check --status
-          echo '=== SHA256 checks passed (Ubuntu Jammy security) ==='
 
           sudo dpkg -i \
             "$PKG_DIR/libtinfo5_${VERSION}_amd64.deb" \
             "$PKG_DIR/libncurses5_${VERSION}_amd64.deb"
           sudo ldconfig
-          ldconfig -p | grep -F 'libtinfo.so.5'
-          ldconfig -p | grep -F 'libncurses.so.5'
-          echo '=== LEGACY RENDERSCRIPT CLANG DEPENDENCIES ==='
           CLANG=prebuilts/clang/host/linux-x86/clang-3289846/bin/clang.real
           if [ ! -x "$CLANG" ]; then
             echo "::error::Expected legacy RenderScript Clang missing: $CLANG"
@@ -1415,7 +905,6 @@ jobs:
             exit 1
           fi
           "$CLANG" --version
-          echo '=== LEGACY RENDERSCRIPT CLANG PREFLIGHT PASSED ==='
 
       - name: Install pinned AOSP reclient 0.172 with matching Clang scanner
         working-directory: /home/runner/work/los
@@ -1423,8 +912,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # AOSP platform/prebuilts/remoteexecution-client, 2025-03-07.
-          # This commit's live/ snapshot is version 0.172.0.3cf60ba5.
           PINNED_COMMIT="943a1532c17256a37eb6d90cdba450ff761b36d1"
           PINNED_VERSION="0.172.0.3cf60ba5"
           PINNED_TREE="live"
@@ -1437,14 +924,11 @@ jobs:
             https://android.googlesource.com/platform/prebuilts/remoteexecution-client
           git -C "$FETCH_DIR" config core.sparseCheckout true
           printf '%s\n' "/${PINNED_TREE}/" > "$FETCH_DIR/.git/info/sparse-checkout"
-          echo "=== FETCH PINNED RECLIENT ==="
           git -C "$FETCH_DIR" -c protocol.version=2 fetch --depth=1 \
             --filter=blob:none origin "$PINNED_COMMIT"
           git -C "$FETCH_DIR" checkout -q --detach FETCH_HEAD
           test "$(git -C "$FETCH_DIR" rev-parse HEAD)" = "$PINNED_COMMIT"
 
-          # Do not use a moving "live" name at runtime. Copy this commit's
-          # immutable live/ snapshot into a version-specific standalone path.
           test -d "$FETCH_DIR/$PINNED_TREE"
           test -s "$FETCH_DIR/$PINNED_TREE/version.txt"
           actual_version="$(tr -d '\r\n' < "$FETCH_DIR/$PINNED_TREE/version.txt")"
@@ -1457,130 +941,48 @@ jobs:
             test -s "$DEST/$bin" || { echo "::error::Missing reclient component: $bin"; exit 1; }
             test -x "$DEST/$bin" || chmod 0755 "$DEST/$bin"
           done
-          test "$(tr -d '\r\n' < "$DEST/version.txt")" = "$PINNED_VERSION"
-          # Record hashes for reproducibility without embedding opaque binary
-          # checksums tied to a different AOSP revision.
           ( cd "$DEST" && sha256sum rewrapper reproxy bootstrap scandeps_server version.txt ) \
             | tee /tmp/rbe-test/reclient-sha256.txt
-          # P0.2: register Soong host tool after trimming the original project.
-          # ART run-test genrules use tools: ["rewrapper"] and need an Android.bp
-          # module, even when the standalone rewrapper executable exists.
-          # Restore ONLY this tiny module, not the multi-version project checkout.
+
           RBE_BP="prebuilts/remoteexecution-client/Android.bp"
           if [ -e "$RBE_BP" ]; then
             echo "::error::Unexpected existing Android.bp: $RBE_BP; refusing to overwrite it."
             exit 1
           fi
           cat > "$RBE_BP" <<EOFRBE_BP
-          // Lightweight Soong registration for the separately pinned AOSP reclient.
           prebuilt_build_tool {
               name: "rewrapper",
               src: "compat-${PINNED_VERSION}/rewrapper",
           }
           EOFRBE_BP
-          test -s "$RBE_BP"
-          test -x "$DEST/rewrapper"
-          echo '=== SOONG REWRAPPER MODULE REGISTRATION ==='
-          cat "$RBE_BP" | tee /tmp/rbe-test/rewrapper-Android.bp.txt
-
-          # The one-time shallow/sparse clone is no longer needed during build.
           rm -rf "$FETCH_DIR"
 
-          echo '=== P0 PINNED RECLIENT STORAGE ==='
           du -sh "$DEST" prebuilts/remoteexecution-client 2>/dev/null \
             | tee /tmp/rbe-test/p0-reclient-size.txt
-          if [ -e prebuilts/remoteexecution-client/live ]; then
-            echo '::error::Unexpected repo-synced reclient/live directory; P0 trim was bypassed.'
-            exit 1
-          fi
-          printf '%s\t%s\t%s\t%s\t%s\n' \
-            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" 'post-pinned-reclient' \
-            "$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')" \
-            "$(df -B1 --output=used "$PWD" | tail -n1 | tr -d ' ')" \
-            "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" \
-            >> /tmp/rbe-test/resource-samples.tsv
-
           printf 'pinned_commit=%s\npinned_version=%s\npinned_source_tree=%s\ndepsscanner_address=execrel://\n' \
             "$PINNED_COMMIT" "$PINNED_VERSION" "$PINNED_TREE" \
             > /tmp/rbe-test/reclient-version.txt
           echo "RBE_DIR=$DEST" >> "$GITHUB_ENV"
-          # Soong remoteexec defaults to live/rewrapper, which we trimmed.
-          # Force the same pinned executable for C/C++ RBE actions.
           echo "RBE_WRAPPER=$DEST/rewrapper" >> "$GITHUB_ENV"
-          echo "=== RECLIENT VERSION ==="
-          "$DEST/rewrapper" --version 2>&1 | tee -a /tmp/rbe-test/reclient-version.txt || true
-          "$DEST/reproxy" --version 2>&1 | tee -a /tmp/rbe-test/reclient-version.txt || true
-          test -x "$DEST/bootstrap"
 
       - name: Inspect Android reclient
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -e
-
-          echo "=== RECLIENT DIRECTORY ==="
-          ls -lah "$RBE_DIR"
-
           test -x "$RBE_DIR/reproxy"
           test -x "$RBE_DIR/rewrapper"
           test -x "$RBE_DIR/bootstrap"
+          test -x "$RBE_DIR/scandeps_server"
           test -x "$RBE_WRAPPER"
           test -s prebuilts/remoteexecution-client/Android.bp
-          grep -Eq '^[[:space:]]*name:[[:space:]]*"rewrapper"' \
-            prebuilts/remoteexecution-client/Android.bp
-          echo "RBE_WRAPPER=$RBE_WRAPPER"
-          echo '=== SOONG REWRAPPER MODULE ==='
-          cat prebuilts/remoteexecution-client/Android.bp
-
-          echo "=== PINNED RBE SCANNER: REQUIRED ==="
-          test -x "$RBE_DIR/scandeps_server"
-          test -s "$RBE_DIR/version.txt"
-          test "$(tr -d '\r\n' < "$RBE_DIR/version.txt")" = '0.172.0.3cf60ba5'
-          test "${RBE_depsscanner_address:-}" = 'execrel://'
-          echo "scanner=$RBE_DIR/scandeps_server"
-          echo "scanner_address=$RBE_depsscanner_address"
-          # Standalone scanner may be a static binary (ldd exits nonzero);
-          # missing shared libraries remain a hard failure.
           ( ldd "$RBE_DIR/scandeps_server" 2>&1 || true ) \
             | tee /tmp/rbe-test/reclient-scanner-ldd.txt
           if grep -q 'not found' /tmp/rbe-test/reclient-scanner-ldd.txt; then
             echo '::error::Standalone Clang dependency scanner has missing shared libraries.'
             exit 1
           fi
-          echo "=== CLANG 18 FLAG COMPATIBILITY PREFLIGHT ==="
-          CLANG_CPP=prebuilts/clang/host/linux-x86/clang-r510928/bin/clang++
-          test -x "$CLANG_CPP"
-          {
-            "$CLANG_CPP" --version
-            printf 'int main() { int x = 0; return x; }\n' \
-              | "$CLANG_CPP" -x c++ -std=c++17 -g -gz=zstd \
-                  -ftrivial-auto-var-init=zero -c - \
-                  -o /tmp/rbe-test/clang18-flags-preflight.o
-            test -s /tmp/rbe-test/clang18-flags-preflight.o
-            stat -c 'clang_smoke_object_bytes=%s' \
-              /tmp/rbe-test/clang18-flags-preflight.o
-          } > /tmp/rbe-test/clang18-flags-preflight.log 2>&1 || {
-            cat /tmp/rbe-test/clang18-flags-preflight.log
-            echo '::error::Checked-out Clang toolchain did not accept required flags.'
-            exit 1
-          }
-          cat /tmp/rbe-test/clang18-flags-preflight.log
-          # The real remote dependency-scanner proof follows after graph
-          # generation in the existing remote-only libbase smoke stage.
 
-          echo "=== REPROXY VERSION ==="
-          "$RBE_DIR/reproxy" --version || true
-
-          echo "=== REWRAPPER VERSION ==="
-          "$RBE_DIR/rewrapper" --version || true
-
-          echo "=== BOOTSTRAP VERSION ==="
-          "$RBE_DIR/bootstrap" --version || true
-
-      # Reclient 0.172 ClangScanDeps has a reproducible preprocessor parsing
-      # failure on two Sonivox .s inputs. Keep remote-only compilation for all
-      # other actions; execute these exact two ARM assembly sources locally.
-      # Preflight Clang -E is not a substitute for real compiler smoke below.
       - name: Route only two Sonivox ARM assembly actions around RBE scanner
         working-directory: /home/runner/work/los
         shell: bash
@@ -1597,8 +999,6 @@ jobs:
           set -euo pipefail
           SELF_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
           REAL="$SELF_DIR/rewrapper.remote-original"
-          # Match *only* these two Sonivox sources.  All other calls go to
-          # pinned reclient unchanged, including --version and normal C/C++.
           matched=''
           for arg in "$@"; do
             case "$arg" in
@@ -1611,13 +1011,11 @@ jobs:
           if [[ -z "$matched" ]]; then
             exec "$REAL" "$@"
           fi
-          # Find the exact pinned clang executable in the command handed to
-          # rewrapper.  Do not parse compiler flags as rewrapper flags.
           argv=("$@")
           idx=0
           while (( idx < ${#argv[@]} )); do
             case "${argv[$idx]}" in
-              prebuilts/clang/host/linux-x86/*/bin/clang|prebuilts/clang/host/linux-x86/*/bin/clang|prebuilts/clang/host/linux-x86/*/bin/clang++)
+              prebuilts/clang/host/linux-x86/*/bin/clang|prebuilts/clang/host/linux-x86/*/bin/clang++)
                 break ;;
             esac
             idx=$((idx + 1))
@@ -1631,7 +1029,6 @@ jobs:
             echo "SONIVOX_ASM_LOCAL_ERROR compiler not executable: $compiler" >&2
             exit 86
           fi
-          echo "SONIVOX_ASM_LOCAL_COMPILE: $matched using $compiler" >&2
           printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$matched" "$compiler" \
             >> /tmp/rbe-test/sonivox-local-assembly.tsv
           exec "${argv[@]:idx}"
@@ -1639,59 +1036,25 @@ jobs:
           chmod 0755 "$WRAPPER"
           test -x "$REAL"
           test -x "$WRAPPER"
-          "$WRAPPER" --version > /tmp/rbe-test/sonivox-wrapper-version.txt 2>&1 || true
-          {
-            echo 'mode=local-only-exact-sonivox-arm-assembly'
-            echo "rewrapper_shim=$WRAPPER"
-            echo "pinned_original=$REAL"
-            echo 'sources=ARM-E_filter_gnu.s,ARM-E_mastergain_gnu.s'
-            echo 'other_actions=unchanged-reclient-remote-only'
-          } | tee /tmp/rbe-test/sonivox-assembly-fallback.txt
 
       - name: Check BuildBuddy network connectivity
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -e
-
-          echo "=== DNS ==="
           getent hosts remote.buildbuddy.io
-
-          echo "=== TCP 443 ==="
           timeout 15 bash -c 'cat < /dev/null > /dev/tcp/remote.buildbuddy.io/443'
-
           echo "BuildBuddy TCP endpoint is reachable."
-
-          echo "=== BUILD BUDDY TLS CHAIN DIAGNOSTIC ==="
-          TLS_LOG="/tmp/rbe-test/buildbuddy-tls-check.log"
-          mkdir -p /tmp/rbe-test
-          if ! timeout 20 openssl s_client \
-            -connect remote.buildbuddy.io:443 \
-            -servername remote.buildbuddy.io \
-            -verify_hostname remote.buildbuddy.io \
-            -verify_return_error \
-            -CAfile /etc/ssl/certs/ca-certificates.crt \
-            </dev/null > "$TLS_LOG" 2>&1; then
-            echo "::warning::OpenSSL certificate precheck returned an error; see artifact."
-          fi
-          grep -E 'Verification:|Verify return code:|verify error:|Verification error:|^subject=|^issuer=' "$TLS_LOG" | tail -30 || true
-
-          echo "Authentication will be validated by the real reclient compile below."
 
       - name: Start authenticated BuildBuddy gRPC bridge
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
-
-          # This is needed for Android 11's old reclient which cannot attach
-          # custom gRPC metadata. The only cleartext hop is loopback.
           BRIDGE_DIR="/tmp/buildbuddy-rbe-bridge"
           install -d -m 700 "$BRIDGE_DIR" /tmp/rbe-test
           umask 077
 
-          # Never write the secret into workflow logs, a command argument,
-          # or the uploaded /tmp/rbe-test artifact directory.
           python3 - <<'PYBRIDGE'
           import os
           from pathlib import Path
@@ -1700,12 +1063,11 @@ jobs:
           if not secret or any(ch in secret for ch in ('\n', '\r', '\x00')):
               raise SystemExit('Invalid BuildBuddy API key format')
 
-          # Escape an nginx double-quoted string safely.
           encoded = secret.replace('\\', '\\\\').replace('"', '\\"')
-          config = '''worker_processes 1;
+          config = '''worker_processes auto;
           pid /tmp/buildbuddy-rbe-bridge/nginx.pid;
           error_log /tmp/rbe-test/buildbuddy-grpc-errors.log warn;
-          events { worker_connections 1024; }
+          events { worker_connections 2048; }
           http {
             access_log off;
             client_max_body_size 0;
@@ -1717,7 +1079,6 @@ jobs:
                 grpc_ssl_server_name on;
                 grpc_ssl_name remote.buildbuddy.io;
                 grpc_ssl_verify on;
-                # Android 11 bridge: allow intermediate CAs in the TLS chain.
                 grpc_ssl_verify_depth 5;
                 grpc_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
                 grpc_connect_timeout 30s;
@@ -1761,15 +1122,11 @@ jobs:
           : > "$DISK_STATUS"
           rm -f "$ZRAM_DEVICE_FILE"
 
-          # A dedicated new device only: do not reset or alter existing swap.
-          echo '=== ZRAM CAPABILITY / SETUP ==='
           if ! command -v zramctl >/dev/null 2>&1; then
             printf 'status=unavailable\nreason=zramctl-not-installed\n' > "$ZRAM_STATUS"
           else
-            # It may already be built into the kernel; modprobe failure is not fatal.
             sudo modprobe zram num_devices=1 2>>/tmp/rbe-test/zram-setup-errors.log || true
             zram_dev=''
-            # lz4 tends to minimize CPU overhead; use kernel default if absent.
             if zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" --algorithm zstd 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
               zram_algorithm=zstd
             elif zram_dev="$(sudo zramctl --find --size "${SOONG_ZRAM_GIB}G" 2>>/tmp/rbe-test/zram-setup-errors.log)"; then
@@ -1784,40 +1141,22 @@ jobs:
               printf '%s\n' "$zram_dev" > "$ZRAM_DEVICE_FILE"
               printf 'status=enabled\ndevice=%s\nsize_gib=%s\nalgorithm=%s\npriority=100\n' \
                 "$zram_dev" "$SOONG_ZRAM_GIB" "$zram_algorithm" > "$ZRAM_STATUS"
-              echo "ZRAM activated: $zram_dev size=${SOONG_ZRAM_GIB}GiB algorithm=$zram_algorithm priority=100"
             else
               printf 'status=unavailable\nreason=kernel-or-activation-error\n' > "$ZRAM_STATUS"
-              if [ -n "$zram_dev" ]; then
-                sudo swapoff "$zram_dev" >/dev/null 2>&1 || true
-                # Only reset if not registered as active swap.
-                if ! swapon --noheadings --show=NAME | grep -Fxq "$zram_dev"; then
-                  sudo zramctl --reset "$zram_dev" >/dev/null 2>&1 || true
-                fi
-              fi
-              echo '::warning::ZRAM unavailable; continuing with disk swap fallback.'
             fi
           fi
 
-          # Disk-swap layout: 4-GiB baseline + 8-GiB graph-only extension.
-          # Higher priority on baseline ensures graph-only file is used last,
-          # improving the chance it is empty after the Soong process exits.
-          # Never allocate below the reserved free-space floor.
-          echo '=== DISK SWAP SIZING ==='
           disk_free_bytes="$(df -B1 --output=avail /mnt | tail -n1 | tr -d ' ')"
           disk_free_gib=$((disk_free_bytes / GIB))
           reserve_gib="${SOONG_SWAP_DISK_RESERVE_GIB}"
           target_gib="${SOONG_DISK_SWAP_GIB}"
           if (( disk_free_bytes < (target_gib + reserve_gib) * GIB )); then
-            # A smaller fallback still respects the same reserve.
             target_gib=$((disk_free_gib - reserve_gib))
             if (( target_gib > SOONG_DISK_SWAP_GIB )); then target_gib="$SOONG_DISK_SWAP_GIB"; fi
           fi
           if (( target_gib < BASE_GIB )); then
-            echo "::warning::Not enough disk for even ${BASE_GIB}GiB swap with ${reserve_gib}GiB reserve."
             target_gib=0
           fi
-          printf 'status=disabled\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=0\nreserve_gib=%s\n' \
-            "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$reserve_gib" > "$DISK_STATUS"
           allocate_swap() {
             local path="$1" size_gib="$2" priority="$3"
             if ! sudo fallocate -l "${size_gib}G" "$path"; then
@@ -1826,7 +1165,6 @@ jobs:
             fi
             sudo chmod 600 "$path"
             if sudo mkswap "$path" >/dev/null && sudo swapon --priority "$priority" "$path"; then
-              echo "SWAP_ON path=$path size_gib=$size_gib priority=$priority"
               return 0
             fi
             sudo swapoff "$path" >/dev/null 2>&1 || true
@@ -1838,31 +1176,16 @@ jobs:
             if allocate_swap "$BASE_SWAP" "$BASE_GIB" 20; then
               allocated="$BASE_GIB"
               graph_gib=$((target_gib - BASE_GIB))
-              if (( graph_gib > 0 )); then
-                if allocate_swap "$GRAPH_SWAP" "$graph_gib" 10; then
-                  allocated=$((allocated + graph_gib))
-                else
-                  echo '::warning::Graph-only swap allocation failed, base swap still enabled.'
-                fi
+              if (( graph_gib > 0 )) && allocate_swap "$GRAPH_SWAP" "$graph_gib" 10; then
+                allocated=$((allocated + graph_gib))
               fi
-            else
-              echo '::warning::Baseline disk swap allocation failed.'
             fi
           fi
           printf 'status=%s\ndisk_free_before_gib=%s\nrequested_gib=%s\nallocated_gib=%s\nreserve_gib=%s\nbase_gib=%s\n' \
             "$( (( allocated > 0 )) && echo enabled || echo disabled)" \
             "$disk_free_gib" "$SOONG_DISK_SWAP_GIB" "$allocated" "$reserve_gib" "$BASE_GIB" \
             > "$DISK_STATUS"
-          if (( allocated < SOONG_DISK_SWAP_GIB )); then
-            echo "::warning::Disk swap available ${allocated}/${SOONG_DISK_SWAP_GIB} GiB (disk-reserve safeguard)."
-          fi
-          echo '=== ACTIVE HYBRID SWAP ==='
-          cat "$ZRAM_STATUS" "$DISK_STATUS"
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
-          zramctl || true
-          free -h
-          df -h /mnt /home/runner/work/los
-          # Failing to activate any swap is not a successful 15-GiB trial.
           if ! swapon --noheadings --show=NAME | grep -q .; then
             echo '::error::No active swap device; aborting before the known Soong memory peak.'
             exit 1
@@ -1870,16 +1193,12 @@ jobs:
 
       - name: Configure Lineage and build full star2lte ROM via BuildBuddy
         working-directory: /home/runner/work/los
-        # The 320-minute job-clock guard below leaves time for cleanup/upload.
         timeout-minutes: 360
         shell: bash
         run: |
           set -eo pipefail
           mkdir -p /tmp/rbe-test
 
-          # P0.1: capture early setup output, even when envsetup or lunch fails
-          # before m-nothing.log / rbe-env.txt can be created.
-          # Preserve Actions stdout/stderr to avoid duplicating long build logs.
           exec 3>&1 4>&2
           exec > >(tee -a /tmp/rbe-test/configure-setup.log) 2>&1
           CURRENT_STAGE=configure-start
@@ -1894,13 +1213,11 @@ jobs:
           on_error() {
             LAST_FAILURE_LINE="$1"
             LAST_FAILURE_COMMAND="$2"
-            # Never enable set -x: BuildBuddy credentials are in the environment.
             printf 'Failure observed at line=%s in stage=%s\n' "$LAST_FAILURE_LINE" "$CURRENT_STAGE" >&2
           }
           on_exit() {
             local rc=$?
             trap - EXIT
-            # Retain the original process-tree cleanup if build is interrupted.
             if [ -n "${BUILD_PID:-}" ] && kill -0 "$BUILD_PID" 2>/dev/null; then
               if declare -F stop_process_tree >/dev/null; then
                 stop_process_tree "$BUILD_PID" || true
@@ -1915,10 +1232,8 @@ jobs:
                 printf 'timestamp=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
               } > /tmp/rbe-test/configure-failure.txt
               echo "::error::Configure failed: stage=$CURRENT_STAGE exit=$rc line=${LAST_FAILURE_LINE:-unknown}"
-              echo '=== FAILURE DISK / MEMORY SNAPSHOT ==='
               df -h /home/runner/work/los || true
               free -h || true
-              du -sh out 2>/dev/null || true
             else
               printf 'exit_code=0\nstage=%s\n' "$CURRENT_STAGE" \
                 > /tmp/rbe-test/configure-success.txt
@@ -1931,21 +1246,6 @@ jobs:
               "$signal" "$CURRENT_STAGE" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
               "${GITHUB_RUN_ID:-unknown}" "${GITHUB_RUN_ATTEMPT:-unknown}" \
               > /tmp/rbe-test/termination-signal.txt
-            {
-              echo '=== SIGNAL MEMORY SNAPSHOT ==='
-              free -h
-              swapon --show || true
-              ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
-              if [ -r /sys/fs/cgroup/memory.events ]; then
-                echo '=== MEMORY CGROUP EVENTS ==='
-                cat /sys/fs/cgroup/memory.events
-              fi
-              grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
-              if declare -F record_memory_pressure >/dev/null; then
-                record_memory_pressure "signal-$signal" || true
-              fi
-            } >> /tmp/rbe-test/memory-pressure.log 2>&1
-            echo "::error::Received $signal during $CURRENT_STAGE; SIGTERM alone cannot distinguish cancellation from resource pressure." >&2
             exit "$rc"
           }
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -1954,25 +1254,10 @@ jobs:
           trap on_exit EXIT
           mark_stage configure-start
 
-          echo "=== DATE / OS / SHELL ==="
-          date -u +'%Y-%m-%dT%H:%M:%SZ'
-          pwd -P
-          bash --version | head -1
-          echo "=== JAVA CANDIDATES (NO OVERRIDE YET) ==="
-          command -v java || true
-          java -version 2>&1 || true
-          ls -ld prebuilts/jdk/jdk11/linux-x86 prebuilts/jdk/jdk17/linux-x86 \
-            2>/dev/null || true
-
-          # LineageOS 21.0 / Android 14 requires PRODUCT-RELEASE-VARIANT.
-          # Release "ap2a" comes from build/release/release_config_map.mk.
           if [ ! -f build/envsetup.sh ]; then
             echo "::error::Missing build/envsetup.sh; check repo sync and working-directory."
             exit 1
           fi
-          # Android envsetup/lunch are designed to run in an interactive-like
-          # shell. Avoid inherited ERR traps changing command-substitution output
-          # (previously visible as the bogus ".../Failure observed" filename).
           trap - ERR
           set +e
           mark_stage envsetup
@@ -1982,22 +1267,17 @@ jobs:
             echo "::error::envsetup.sh returned $ENVSETUP_RC" >&2
             exit "$ENVSETUP_RC"
           fi
-          echo '=== ENVSETUP PASSED ==='
           mark_stage lunch
           lunch lineage_star2lte-ap2a-userdebug
           LUNCH_RC=$?
-          # Restore strict error checking only after the Lineage shell setup.
           set -e
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
           if [ "$LUNCH_RC" -ne 0 ]; then
             echo "::error::lunch returned $LUNCH_RC" >&2
             exit "$LUNCH_RC"
           fi
-          echo '=== LUNCH PASSED ==='
           mark_stage java-selection
 
-          # Android 14 uses JDK 17. Do not force the older JDK 11 after lunch.
-          # Keep the Java variables consistent with the checked-out prebuilt.
           JDK17="$PWD/prebuilts/jdk/jdk17/linux-x86"
           if [ ! -x "$JDK17/bin/java" ]; then
             echo "::error::Bundled JDK 17 is missing: $JDK17/bin/java"
@@ -2006,11 +1286,8 @@ jobs:
           export JAVA_HOME="$JDK17"
           export ANDROID_JAVA_HOME="$JDK17"
           export PATH="$JAVA_HOME/bin:$PATH"
-          "$JAVA_HOME/bin/java" -version
           export USE_CCACHE=0
           export CCACHE_DISABLE=1
-          # The checked-out Go toolchain may be older than Go 1.19.
-          # GOMEMLIMIT does not exist on Go 1.18; never claim it worked there.
           export GOGC="$SOONG_GOGC"
           unset GOMEMLIMIT || true
           GO_BIN="$PWD/prebuilts/go/linux-x86/bin/go"
@@ -2030,22 +1307,6 @@ jobs:
           printf 'go_tool=%s\ngo_version=%s\ngogc=%s\ngomemlimit_mode=%s\ngomemlimit_value=%s\n' \
             "$GO_BIN" "$GO_VERSION" "$GOGC" "$GO_LIMIT_MODE" \
             "${GOMEMLIMIT:-disabled}" > /tmp/rbe-test/soong-go-runtime.txt
-          cat /tmp/rbe-test/soong-go-runtime.txt
-          if [ "$GO_LIMIT_MODE" != 'enabled-soft-limit' ]; then
-            echo '::warning::Prebuilt Go is older than 1.19 or unverified: GOMEMLIMIT=6GiB cannot be guaranteed. GOGC=25 is still applied.'
-          fi
-          echo '=== SWAP ==='
-          free -h
-          swapon --show || true
-          echo "=== JAVA VERSION ==="
-          java -version 2>&1 || true
-
-          echo "=== LINEAGE BUILD SELECTION ==="
-          echo "ANDROID_BUILD_TOP=${ANDROID_BUILD_TOP:-unset}"
-          echo "TARGET_PRODUCT=${TARGET_PRODUCT:-unset}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE:-unset}"
-          echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-unset}"
-          echo "TARGET_BUILD_TYPE=${TARGET_BUILD_TYPE:-unset}"
 
           if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
              [ "${TARGET_PRODUCT:-}" != "lineage_star2lte" ] || \
@@ -2055,37 +1316,21 @@ jobs:
             exit 1
           fi
 
-          if [ "$(cd "$ANDROID_BUILD_TOP" && pwd -P)" != "$(pwd -P)" ]; then
-            echo "::error::ANDROID_BUILD_TOP does not point at the current source tree."
-            exit 1
-          fi
-
-          # Keep working_directory non-empty ("los") for BuildBuddy, while
-          # upgraded reclient handles output_files relative to that directory.
           export RBE_exec_root="$(dirname "$(pwd -P)")"
           RBE_REL_WORKDIR="$(realpath --relative-to="$RBE_exec_root" "$(pwd -P)")"
 
           mark_stage rbe-configuration
-          # Ensure Soong and ART both resolve the pinned rewrapper, not live/.
           export RBE_WRAPPER="$RBE_DIR/rewrapper"
           test -x "$RBE_WRAPPER"
           test -s prebuilts/remoteexecution-client/Android.bp
-          echo "=== RBE WORKING DIRECTORY COMPATIBILITY ==="
-          echo "RBE_exec_root=$RBE_exec_root"
-          echo "RBE_REL_WORKDIR=$RBE_REL_WORKDIR"
           if [ "$RBE_REL_WORKDIR" != "los" ]; then
             echo "::error::Unexpected RBE working directory: $RBE_REL_WORKDIR"
-            exit 1
-          fi
-          if [ ! -d "$RBE_exec_root/$RBE_REL_WORKDIR/bionic" ]; then
-            echo "::error::Android source tree is missing under RBE_exec_root."
             exit 1
           fi
           printf 'RBE_exec_root=%s\nRBE_relative_working_dir=%s\n' \
             "$RBE_exec_root" "$RBE_REL_WORKDIR" \
             > /tmp/rbe-test/rbe-working-directory.txt
 
-          echo "=== EFFECTIVE RBE CONFIG ==="
           {
             echo "USE_RBE=${USE_RBE}"
             echo "RBE_service=${RBE_service}"
@@ -2096,29 +1341,13 @@ jobs:
             echo "RBE_exec_root=${RBE_exec_root}"
             echo "RBE_relative_working_dir=${RBE_REL_WORKDIR}"
             echo "RBE_CXX_EXEC_STRATEGY=${RBE_CXX_EXEC_STRATEGY}"
-            echo "RBE_use_application_default_credentials=${RBE_use_application_default_credentials}"
-            echo "RBE_use_rpc_credentials=${RBE_use_rpc_credentials}"
-            echo "RBE_service_no_auth=${RBE_service_no_auth}"
-            echo "BuildBuddy auth=loopback nginx gRPC bridge (TLS upstream)"
-            echo "RBE_log_dir=${RBE_log_dir}"
-            echo "RBE_log_path=${RBE_log_path}"
-            echo "RBE_proxy_log_dir=${RBE_proxy_log_dir}"
-            echo "RBE_v=${RBE_v}"
-            echo "RBE_output_dir=${RBE_output_dir}"
             echo "NINJA_REMOTE_NUM_JOBS=${NINJA_REMOTE_NUM_JOBS}"
             echo "NINJA_HIGHMEM_NUM_JOBS=${NINJA_HIGHMEM_NUM_JOBS}"
-            echo "NINJA_LOCAL_PARALLEL=2"
+            echo "NINJA_LOCAL_PARALLEL=$(nproc)"
             echo "WORKSPACE_STORAGE=${WORKSPACE_STORAGE}"
           } | tee /tmp/rbe-test/rbe-env.txt
 
-          # Write stage-specific samples for easy comparison, using bytes
-          # instead of the rounded df -h values.
           DISK_SAMPLES=/tmp/rbe-test/resource-samples.tsv
-          if [ ! -f "$DISK_SAMPLES" ]; then
-            printf 'timestamp\tstage\tdisk_available_bytes\tdisk_used_bytes\tmem_available_kib\n' > "$DISK_SAMPLES"
-          fi
-          # Btrfs loop-image logical capacity is NOT host free space.
-          # Both root and inner Btrfs are checked, and the smaller governs.
           BTRFS_ACTIVE=0
           BTRFS_BACKING=/tmp/los20-workspace-btrfs.img
           if [ "$WORKSPACE_STORAGE" = btrfs_zstd ]; then
@@ -2157,8 +1386,6 @@ jobs:
             fi
             echo "=== DISK AT ${stage}: $((available / 1073741824)) GiB physical-safe free ==="
           }
-          # The 320-minute deadline is measured from post-reclaim, not from
-          # the start of bacon. Supervise Soong graph generation as well.
           if [ -s /tmp/rbe-test/job-start-epoch.txt ]; then
             JOB_START_EPOCH="$(cat /tmp/rbe-test/job-start-epoch.txt)"
           else
@@ -2167,10 +1394,6 @@ jobs:
           SOFT_DEADLINE_EPOCH=$(( JOB_START_EPOCH + FULL_ROM_SOFT_DEADLINE_MINUTES * 60 ))
           echo "=== WHOLE-JOB SOFT DEADLINE (UTC) ==="
           date -u -d "@$SOFT_DEADLINE_EPOCH" +'%Y-%m-%dT%H:%M:%SZ'
-          if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
-            echo '::error::Whole-job soft deadline already reached before Soong graph generation.'
-            exit 71
-          fi
 
           stop_process_tree() {
             local pid="$1" child
@@ -2180,8 +1403,7 @@ jobs:
             done < <(pgrep -P "$pid" 2>/dev/null || true)
             kill -TERM "$pid" 2>/dev/null || true
           }
-          # Identify the current cgroup (GitHub-hosted Ubuntu usually uses v2).
-          # Always prefer the process's own cgroup, not host-wide counters.
+
           CGROUP_MEMORY_DIR=''
           if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
             CGROUP_REL="$(awk -F: '$1=="0" {print $3; exit}' /proc/self/cgroup)"
@@ -2192,8 +1414,7 @@ jobs:
             fi
           fi
           cgroup_read() {
-            local name="$1" file
-            file="${CGROUP_MEMORY_DIR}/${name}"
+            local name="$1" file="${CGROUP_MEMORY_DIR}/${1}"
             if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$file" ]; then
               cat "$file" 2>/dev/null || printf 'na'
             else
@@ -2201,60 +1422,13 @@ jobs:
             fi
           }
           cgroup_event_value() {
-            local name="$1" file
-            file="${CGROUP_MEMORY_DIR}/memory.events"
+            local name="$1" file="${CGROUP_MEMORY_DIR}/memory.events"
             if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$file" ]; then
               awk -v key="$name" '$1==key {print $2; found=1; exit} END {if (!found) print "na"}' "$file"
             else
               printf 'na'
             fi
           }
-          # Top RSS processes and Soong's VmRSS/VmHWM/VmSwap identify whether
-          # Go/Soong or another host process is consuming the RAM.
-          record_memory_pressure() {
-            local label="$1" pid
-            {
-              echo "=== $label $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
-              free -h
-              swapon --show || true
-              zramctl 2>/dev/null || true
-              if [ -r /tmp/rbe-test/zram-device.txt ]; then
-                zram_dev="$(cat /tmp/rbe-test/zram-device.txt)"
-                zram_node="${zram_dev##*/}"
-                if [ -r "/sys/block/${zram_node}/mm_stat" ]; then
-                  echo "--- ZRAM ${zram_node} MM_STAT (orig/compressed/mem_used in bytes) ---"
-                  cat "/sys/block/${zram_node}/mm_stat"
-                fi
-              fi
-              echo '--- TOP RSS (KiB; command names only; no args or secrets) ---'
-              ps -eo pid,ppid,rss,stat,comm --sort=-rss | head -n 18 || true
-              echo '--- SOONG BUILD PROCESS DETAILS ---'
-              while IFS= read -r pid; do
-                [ -n "$pid" ] || continue
-                echo "pid=$pid"
-                grep -E '^(Name|State|VmRSS|VmHWM|VmSwap|VmSize|Threads):' \
-                  "/proc/$pid/status" 2>/dev/null || true
-                if [ -r "/proc/$pid/smaps_rollup" ]; then
-                  # smaps_rollup may stall heavily when disk swap is saturated.
-                  timeout 3s grep -E '^(Rss|Pss|Swap|Private_Dirty):' \
-                    "/proc/$pid/smaps_rollup" 2>/dev/null || true
-                fi
-              done < <(pgrep -x soong_build 2>/dev/null || true)
-              echo '--- CGROUP V2 MEMORY ---'
-              echo "cgroup_memory_dir=${CGROUP_MEMORY_DIR:-not-available}"
-              for metric in memory.current memory.peak memory.max memory.swap.current \
-                            memory.swap.peak memory.swap.max memory.events memory.events.local; do
-                printf '%s: ' "$metric"
-                if [[ "$metric" == *events* ]]; then printf '\n'; fi
-                cgroup_read "$metric"
-                printf '\n'
-              done
-              echo '--- PSI / HOST VMSTAT ---'
-              [ ! -r /proc/pressure/memory ] || cat /proc/pressure/memory
-              grep -E '^(oom_kill|pswpin|pswpout) ' /proc/vmstat || true
-            } >> /tmp/rbe-test/memory-pressure.log 2>&1
-          }
-          # Machine-readable samples preserve last-second state on cancellation.
           SOONG_MEMORY_TSV=/tmp/rbe-test/soong-memory-samples.tsv
           printf 'timestamp\tphase\tmem_available_kib\tswap_free_kib\tsoong_rss_kib\tsoong_hwm_kib\tsoong_swap_kib\tsoong_pids\tcgroup_memory_current_bytes\tcgroup_memory_peak_bytes\tcgroup_swap_current_bytes\tcgroup_swap_peak_bytes\tcgroup_oom\tcgroup_oom_kill\n' \
             > "$SOONG_MEMORY_TSV"
@@ -2282,68 +1456,7 @@ jobs:
               "$(cgroup_event_value oom)" "$(cgroup_event_value oom_kill)" \
               >> "$SOONG_MEMORY_TSV"
           }
-          # P0: optional observation of the actual primary builder environment.
-          # Unlike the direct Go runtime API patch, these variables are expected
-          # to be absent from the `env -i` command. Never dump all environ.
-          SOONG_ENV_OBSERVED=/tmp/rbe-test/soong-proc-environ.tsv
-          printf 'timestamp\tpid\tGOGC\tGOMEMLIMIT\tGOMAXPROCS\tGODEBUG\n' > "$SOONG_ENV_OBSERVED"
-          ENV_OBSERVED_PIDS=' '
-          observe_primary_soong_environment() {
-            local pid envtext gc limit procs debug
-            while IFS= read -r pid; do
-              [ -r "/proc/$pid/status" ] || continue
-              if [[ "$ENV_OBSERVED_PIDS" == *" $pid "* ]]; then continue; fi
-              if ! grep -aFq -- '--soong_variables' "/proc/$pid/cmdline" 2>/dev/null; then continue; fi
-              [ -r "/proc/$pid/environ" ] || continue
-              envtext="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)"
-              gc="$(printf '%s\n' "$envtext" | sed -n 's/^GOGC=//p' | head -n1)"
-              limit="$(printf '%s\n' "$envtext" | sed -n 's/^GOMEMLIMIT=//p' | head -n1)"
-              procs="$(printf '%s\n' "$envtext" | sed -n 's/^GOMAXPROCS=//p' | head -n1)"
-              debug="$(printf '%s\n' "$envtext" | sed -n 's/^GODEBUG=//p' | head -n1)"
-              printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$pid" \
-                "${gc:-absent}" "${limit:-absent}" "${procs:-absent}" "${debug:-absent}" \
-                >> "$SOONG_ENV_OBSERVED"
-              ENV_OBSERVED_PIDS="${ENV_OBSERVED_PIDS}${pid} "
-            done < <(pgrep -x soong_build 2>/dev/null || true)
-          }
-          # PID-level CPU information, not the wrapper bash process CPU.
-          # %CPU is procps' lifetime-average, not an instantaneous sample.
-          SOONG_PROCESS_TSV=/tmp/rbe-test/soong-process-samples.tsv
-          printf 'timestamp\tphase\tpid\tppid\tpcpu_pct\tpmem_pct\trss_kib\tvsz_kib\telapsed_seconds\tstat\tcomm\n' \
-            > "$SOONG_PROCESS_TSV"
-          sample_soong_processes() {
-            local phase="$1" pid timestamp
-            timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            while IFS= read -r pid; do
-              [ -r "/proc/$pid/status" ] || continue
-              ps -p "$pid" -o pid=,ppid=,%cpu=,%mem=,rss=,vsz=,etimes=,stat=,comm= \
-                2>/dev/null | awk -v t="$timestamp" -v p="$phase" \
-                  'NF>=9 {printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",t,p,$1,$2,$3,$4,$5,$6,$7,$8,$9}' \
-                  >> "$SOONG_PROCESS_TSV" || true
-            done < <(pgrep -x soong_build 2>/dev/null || true)
-          }
-          # Main build log already includes all GC traces (potentially multiple
-          # Go processes). Keep a small extract for quick post-mortem analysis.
-          SOONG_GC_TAIL=/tmp/rbe-test/soong-gc-trace-tail.log
-          extract_soong_gc_tail() {
-            local log_file="$1"
-            [ -s "$log_file" ] || return 0
-            grep -aE '(^|[[:space:]])gc [0-9]+ @' "$log_file" \
-              | tail -n "$SOONG_GRAPH_GC_TAIL_LINES" > "$SOONG_GC_TAIL" || true
-          }
-          : > /tmp/rbe-test/memory-pressure.log
-          if [ -n "$CGROUP_MEMORY_DIR" ] && [ -r "$CGROUP_MEMORY_DIR/memory.events" ]; then
-            cp "$CGROUP_MEMORY_DIR/memory.events" \
-              /tmp/rbe-test/cgroup-memory-events-before-graph.txt || true
-          fi
-          record_memory_pressure pre-graph
-          sample_soong_memory pre-graph
-          sample_soong_processes pre-graph
 
-          # Live diagnostics: NEVER truncate a file still opened by reproxy.
-          # The glog active INFO fd can otherwise develop sparse holes on writes.
-          # Reclaim completed/closed INFO rotations only, and retain tails.
           rbe_prune_closed_info() {
             python3 - "$RBE_CLOSED_INFO_MAX_MIB" "$RBE_INFO_KEEP_MIB" <<'PYPRUNE'
           import os, pathlib, subprocess, sys, time
@@ -2352,7 +1465,6 @@ jobs:
           threshold=int(sys.argv[1])*1048576
           keep=int(sys.argv[2])*1048576
           busy=set()
-          # Enumerate just the fds of reproxy, not all processes on the runner.
           try:
               proc=subprocess.run(['pgrep','-x','reproxy'],capture_output=True,text=True,check=False)
               pids=[int(x) for x in proc.stdout.split() if x.isdigit()]
@@ -2366,16 +1478,14 @@ jobs:
                           busy.add((st.st_dev,st.st_ino))
                       except OSError: pass
               except OSError: pass
-          changed=[]
           for file in root.iterdir():
               if file.is_symlink() or not file.is_file(): continue
               name=file.name
               if not (name.startswith(('reproxy.','bootstrap.','rewrapper.','scandeps_server.')) and
-                     ('.INFO.' in name or name.endswith('.INFO'))): continue
+                      ('.INFO.' in name or name.endswith('.INFO'))): continue
               st=file.stat()
               if st.st_size <= threshold or time.time()-st.st_mtime < 120: continue
               if (st.st_dev,st.st_ino) in busy: continue
-              # Stale files only: preserve the last 4MiB for debugging.
               tmp=file.with_name(file.name+'.ci-compact')
               try:
                   with file.open('rb') as src, tmp.open('wb') as dst:
@@ -2385,81 +1495,11 @@ jobs:
                           if not buf: break
                           dst.write(buf)
                   os.replace(tmp,file)
-                  changed.append((name,st.st_size,file.stat().st_size))
               finally:
                   tmp.unlink(missing_ok=True)
-          log=root/'rbe-live-info-compaction.tsv'
-          if changed:
-              with log.open('a') as f:
-                  for n,b,a in changed:
-                      f.write(f'{time.time():.0f}\t{n}\t{b}\t{a}\n')
-              print(f'RBE_CLOSED_INFO_COMPACTED count={len(changed)} bytes_saved={sum(b-a for _,b,a in changed)}')
           PYPRUNE
           }
-          # Profiles bytes actually occupying disk, not only logical Btrfs space.
-          sample_build_disk_breakdown() {
-            local now image_bytes root_free log_bytes
-            now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            root_free="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
-            image_bytes=0
-            if [ -f "$BTRFS_BACKING" ]; then
-              read -r blocks bsize < <(stat -c '%b %B' "$BTRFS_BACKING")
-              image_bytes=$((blocks*bsize))
-            fi
-            # du can be expensive on out/ at ~100GiB; run only every ~5 minutes.
-            local soong_kib target_kib repo_kib
-            soong_kib="$(du -sk out/soong 2>/dev/null | awk '{print $1}')"
-            target_kib="$(du -sk out/target 2>/dev/null | awk '{print $1}')"
-            repo_kib="$(du -sk .repo 2>/dev/null | awk '{print $1}')"
-            log_bytes="$(du -sk "$(readlink -f /tmp/rbe-test)" 2>/dev/null | awk '{print $1*1024}')"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$root_free" "$image_bytes" "${soong_kib:-0}" "${target_kib:-0}" "${repo_kib:-0}" >> /tmp/rbe-test/build-storage-breakdown.tsv
-            printf '%s\t%s\n' "$now" "${log_bytes:-0}" >> /tmp/rbe-test/rbe-log-size-samples.tsv
-            echo "STORAGE_PROFILE root_free_gib=$((root_free/1073741824)) image_gib=$((image_bytes/1073741824)) out_soong_mib=$((${soong_kib:-0}/1024)) out_target_mib=$((${target_kib:-0}/1024)) repo_mib=$((${repo_kib:-0}/1024)) rbe_log_bytes=${log_bytes:-0}"
-          }
-          printf 'timestamp\troot_available_bytes\timage_physical_bytes\tout_soong_kib\tout_target_kib\trepo_kib\n' > /tmp/rbe-test/build-storage-breakdown.tsv
-          printf 'timestamp\trbe_diagnostics_bytes\n' > /tmp/rbe-test/rbe-log-size-samples.tsv
 
-          profile_soong_intermediates() {
-            local phase="$1" tag="$2"
-            if [ ! -f /tmp/rbe-test/soong_storage_probe.py ]; then return 0; fi
-            if [ ! -d out/soong/.intermediates ]; then return 0; fi
-            # Run asynchronously so the 10s disk guard is never blocked by a
-            # potentially slow scan over hundreds of thousands of entries.
-            (
-              exec 9>/tmp/rbe-test/soong-storage-profile.lock
-              flock -n 9 || exit 0
-              timeout "${SOONG_PROFILE_TIMEOUT_SECONDS}s" python3 /tmp/rbe-test/soong_storage_probe.py \
-                out/soong/.intermediates /tmp/rbe-test "${phase}-${tag}"
-            ) >> /tmp/rbe-test/soong-storage-profile.log 2>&1 &
-          }
-
-          # Run in a separate low-priority process, guarded by flock.
-          # The Ninja supervisor MUST NOT wait for a slow hashing pass.
-          jar_probe_and_dedupe_async() {
-            [ "$JAR_DEDUPE_MODE" != off ] || return 0
-            [ -f /tmp/rbe-test/ci_jar_dedupe.py ] || return 0
-            [ -d out/soong/.intermediates ] || return 0
-            (
-              exec 8>/tmp/rbe-test/jar-dedupe.lock
-              flock -n 8 || exit 0
-              # Use the 10s host-disk guard in the main monitor independently.
-              # Keep I/O priority idle and CPU priority low for the 2-vCPU runner.
-              ionice -c3 nice -n 15 timeout --signal=TERM --kill-after=5s 135s \
-                python3 /tmp/rbe-test/ci_jar_dedupe.py \
-                  --root out/soong/.intermediates \
-                  --diagnostics /tmp/rbe-test \
-                  --mode "$JAR_DEDUPE_MODE" \
-                  --age-minutes "$JAR_DEDUPE_AGE_MINUTES" \
-                  --hash-gib "$JAR_DEDUPE_HASH_GIB" \
-                  --max-files "$JAR_DEDUPE_MAX_FILES" \
-                  --min-host-gib "$JAR_DEDUPE_MIN_FREE_GIB" \
-                || echo "JAR_DEDUPE_WORKER_NONZERO=$?"
-            ) >> /tmp/rbe-test/jar-dedupe-worker.log 2>&1 &
-          }
-
-          # Shared supervisor for both 'nothing' and 'bacon'. It records an
-          # explicit phase exit code and distinguishes disk/time stops from
-          # compiler errors; an external SIGTERM is separately captured above.
           run_monitored_m() {
             local phase="$1" target="$2" log_file="$3" status_file="$4"
             local disk_trip="$5" time_trip="$6" memory_trip="${7:-}"
@@ -2469,23 +1509,20 @@ jobs:
             rm -f "$status_file" "$disk_trip" "$time_trip"
             if [ -n "$memory_trip" ]; then rm -f -- "$memory_trip"; fi
             (
-              # Avoid trap messages being written into Soong's stdout.
               trap - ERR TERM INT
               set +e
               set -o pipefail
               if [ "$phase" = build-graph ]; then
                 export GOMAXPROCS="$SOONG_GRAPH_GOMAXPROCS"
                 if [ "$SOONG_GRAPH_GC_TRACE" = 1 ]; then
-                  # May reach bootstrap helpers, not the env -i primary builder.
-                  # Primary builder has direct in-process GC configuration.
                   export GODEBUG="${GODEBUG:+${GODEBUG},}gctrace=1"
                 fi
-                echo "=== SOONG GRAPH GO RUNTIME: GOGC=$GOGC GOMAXPROCS=$GOMAXPROCS GOMEMLIMIT=${GOMEMLIMIT:-not-supported} GC_TRACE=$SOONG_GRAPH_GC_TRACE ==="
+                LOCAL_JOBS=2
               else
-                # Graph-specific profiling must not slow down full ROM compile.
                 unset GOMAXPROCS GODEBUG || true
+                LOCAL_JOBS="$(nproc)"
               fi
-              m -j3 --skip-soong-tests "$target" 2>&1 | tee "$log_file"
+              m -j"$LOCAL_JOBS" --skip-soong-tests "$target" 2>&1 | tee "$log_file"
               rc=${PIPESTATUS[0]}
               printf '%s\n' "$rc" > "$status_file"
               exit "$rc"
@@ -2508,7 +1545,6 @@ jobs:
                 inner_now="$(df -B1 --output=avail "$PWD" | tail -n1 | tr -d ' ')"
                 line="$line host_free_gib=$((root_now / 1073741824)) btrfs_free_gib=$((inner_now / 1073741824))"
               fi
-              # Three consecutive low-resource samples, not a single dip.
               if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ]; then
                 if (( mem_kib <= GRAPH_MEM_GUARD_RAM_MIB * 1024 && \
                       swap_free_kib <= GRAPH_MEM_GUARD_SWAP_MIB * 1024 )); then
@@ -2520,94 +1556,24 @@ jobs:
               fi
               echo "$line" | tee -a /tmp/rbe-test/resource-monitor.log
               sample_soong_memory "$phase"
-              sample_soong_processes "$phase"
-              if [ "$phase" = build-graph ]; then
-                observe_primary_soong_environment
-                if [ -s /tmp/rbe-test/soong-go-heap.tsv ] && (( sample_counter % 6 == 0 )); then
-                  echo '=== ACTUAL PRIMARY SOONG GO HEAP (last sample, bytes) ==='
-                  tail -n 1 /tmp/rbe-test/soong-go-heap.tsv || true
-                fi
-              fi
-              # Live Actions log survives more cancellation scenarios than
-              # artifact upload. No arguments/credentials are printed.
-              if [ "$phase" = build-graph ]; then
-                soong_rss=0; soong_vmswap=0
-                while IFS= read -r spid; do
-                  [ -r "/proc/$spid/status" ] || continue
-                  sr="$(awk '/^VmRSS:/ {print $2}' "/proc/$spid/status" 2>/dev/null)"
-                  ss="$(awk '/^VmSwap:/ {print $2}' "/proc/$spid/status" 2>/dev/null)"
-                  soong_rss=$((soong_rss + ${sr:-0}))
-                  soong_vmswap=$((soong_vmswap + ${ss:-0}))
-                done < <(pgrep -x soong_build 2>/dev/null || true)
-                zram_used_kib=0; zram_physical_kib=0
-                if [ -s /tmp/rbe-test/zram-device.txt ]; then
-                  zram_dev="$(cat /tmp/rbe-test/zram-device.txt)"
-                  zram_node="${zram_dev##*/}"
-                  if [ -r "/sys/block/$zram_node/mm_stat" ]; then
-                    read -r z_orig z_compressed z_physical _ < "/sys/block/$zram_node/mm_stat" || true
-                    zram_used_kib=$(( ${z_orig:-0} / 1024 ))
-                    zram_physical_kib=$(( ${z_physical:-0} / 1024 ))
-                  fi
-                fi
-                echo "SOONG_MEMORY rss_kib=$soong_rss vm_swap_kib=$soong_vmswap zram_logical_kib=$zram_used_kib zram_physical_kib=$zram_physical_kib cgroup_oom_kill=$(cgroup_event_value oom_kill)"
-              fi
-              # Capture the compiled binary's own Go version once it exists.
-              # A runtime compiled with Go 1.18 cannot enforce GOMEMLIMIT.
-              if [ "$phase" = build-graph ] && [ ! -s /tmp/rbe-test/soong-build-binary-go-version.txt ] \
-                 && [ -x "$ANDROID_BUILD_TOP/out/host/linux-x86/bin/soong_build" ]; then
-                if [ -x "$GO_BIN" ]; then
-                  "$GO_BIN" version -m "$ANDROID_BUILD_TOP/out/host/linux-x86/bin/soong_build" \
-                    > /tmp/rbe-test/soong-build-binary-go-version.txt 2>&1 || true
-                fi
-              fi
-              # smaps_rollup can provoke I/O thrashing when swap is full;
-              # capture deep reports every ~60s, while lightweight samples
-              # remain every ~10s and the guard captures one final snapshot.
-              if (( sample_counter % 6 == 0 )); then
-                record_memory_pressure "$phase"
-              fi
               sample_counter=$((sample_counter + 1))
-              # Trim only inactive INFO rotations every ~60 seconds, never .rrpl.
               if (( sample_counter % RBE_LOG_SCAN_INTERVAL_SAMPLES == 0 )); then
                 rbe_prune_closed_info || true
-              fi
-              # Separate size attributions at ~5-minute cadence, including Btrfs
-              # physical allocation (stat blocks) and the real log target.
-              if (( sample_counter % DISK_PROFILE_INTERVAL_SAMPLES == 0 )); then
-                sample_build_disk_breakdown || true
-              fi
-              if [ "$phase" = full-rom-build ] \
-                 && (( sample_counter % SOONG_PROFILE_INTERVAL_SAMPLES == 0 )); then
-                profile_soong_intermediates "$phase" "$sample_counter" || true
               fi
 
               if [ "$phase" = build-graph ] && [ "$GRAPH_MEM_GUARD_ENABLED" = 1 ] \
                  && (( guard_consecutive >= GRAPH_MEM_GUARD_SAMPLES )); then
-                {
-                  echo "Soong memory safety stop: RAM available <= ${GRAPH_MEM_GUARD_RAM_MIB} MiB and swap free <= ${GRAPH_MEM_GUARD_SWAP_MIB} MiB"
-                  echo "consecutive_samples=$guard_consecutive timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-                  echo "mem_available_kib=$mem_kib swap_free_kib=$swap_free_kib"
-                  echo "cgroup_memory_current=$(cgroup_read memory.current)"
-                  echo "cgroup_swap_current=$(cgroup_read memory.swap.current)"
-                  echo "cgroup_oom_kill=$(cgroup_event_value oom_kill)"
-                  echo '--- SOONG PID / CPU / RSS / VSZ ---'
-                  tail -n 12 "$SOONG_PROCESS_TSV" || true
-                } | tee "$memory_trip"
-                extract_soong_gc_tail "$log_file"
-                record_memory_pressure "graph-memory-guard-trip"
-                echo "::error::Soong graph stopped proactively to preserve runner and diagnostics (exit 72)."
+                echo "Soong memory safety stop triggered" | tee "$memory_trip"
                 stop_process_tree "$BUILD_PID"
                 break
               fi
               if (( available < DISK_STOP_GIB * 1073741824 )); then
                 echo "Disk safety stop in $phase: available below ${DISK_STOP_GIB} GiB" | tee "$disk_trip"
-                echo "::error::Insufficient disk in $phase; terminating children."
                 stop_process_tree "$BUILD_PID"
                 break
               fi
               if (( now >= SOFT_DEADLINE_EPOCH )); then
                 echo "Time safety stop in $phase: passed ${FULL_ROM_SOFT_DEADLINE_MINUTES}-minute whole-job deadline" | tee "$time_trip"
-                echo "::error::Stopping $phase before GitHub job timeout to preserve diagnostics."
                 stop_process_tree "$BUILD_PID"
                 break
               fi
@@ -2615,16 +1581,8 @@ jobs:
                 echo "::warning::Less than ${DISK_WARN_GIB} GiB available in $phase."
                 warned=1
               fi
-              # At most one bounded SHA-256 / duperemove pilot per interval.
-              # No concurrent workers: flock protects the state and hash DB.
-              # Only full ROM stage, never Soong graph or scanner smoke tests.
-              if [ "$phase" = full-rom-build ] \
-                 && (( sample_counter % JAR_DEDUPE_INTERVAL_SAMPLES == 0 )); then
-                jar_probe_and_dedupe_async || true
-              fi
               if (( idle_secs >= 900 && idle_warned == 0 )); then
-                echo "::warning::$phase has produced no new log output for 15 minutes; inspect CPU/process state."
-                ps -o pid,ppid,stat,etime,%cpu,%mem,args -p "$BUILD_PID" || true
+                echo "::warning::$phase has produced no new log output for 15 minutes."
                 idle_warned=1
               fi
               for ((tick=0; tick<2; tick++)); do
@@ -2644,16 +1602,11 @@ jobs:
             if [ -n "$memory_trip" ] && [ -s "$memory_trip" ]; then MONITORED_RC=72; fi
             disk_sample "post-$phase" >/dev/null
             sample_soong_memory "post-$phase exit=$MONITORED_RC"
-            sample_soong_processes "post-$phase exit=$MONITORED_RC"
-            if [ "$phase" = build-graph ]; then extract_soong_gc_tail "$log_file"; fi
-            record_memory_pressure "post-$phase exit=$MONITORED_RC"
             echo "=== $phase EXIT: $MONITORED_RC ==="
           }
 
           enforce_initial_disk_guard pre-graph
           mark_stage build-graph
-          # From here m-nothing.log and full-rom-build.log capture build output.
-          # Do not mirror compiler output into configure-setup.log.
           exec 1>&3 2>&4
           exec 3>&- 4>&-
           : > /tmp/rbe-test/resource-monitor.log
@@ -2665,24 +1618,11 @@ jobs:
             /tmp/rbe-test/graph-time-stop-triggered.txt \
             /tmp/rbe-test/graph-memory-stop-triggered.txt
           if [ "$MONITORED_RC" -ne 0 ]; then
-            echo '=== BUILD GRAPH LOG TAIL ==='
             tail -n 180 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
             echo "::error::Soong build graph failed or was stopped (exit $MONITORED_RC)."
             exit "$MONITORED_RC"
           fi
-          # Verify the instrumentation actually ran inside the primary graph.
-          # A successful cached graph is valid too, but this fresh-run workflow
-          # expects the telemetry marker unless Soong skipped regeneration.
-          if [ -s /tmp/rbe-test/soong-go-heap.tsv ]; then
-            echo '=== PRIMARY SOONG IN-PROCESS GC CONFIRMED ==='
-            tail -n 3 /tmp/rbe-test/soong-go-heap.tsv || true
-          else
-            echo '::warning::No in-process Go heap sample recorded; inspect m-nothing.log and Soong regeneration.'
-          fi
-          # Soong's memory-heavy graph is complete. The prior run left only
-          # ~19 MiB used inside the 8-GiB graph-only swap file, but did not
-          # reclaim it because usage was nonzero. Evict tiny amounts safely.
-          # Never swapoff large/populated swap or unlink an active swap file.
+
           mark_stage post-graph-swap-reclaim
           GRAPH_SWAP=/mnt/soong-swap-graph
           BASE_SWAP=/mnt/soong-swap-base
@@ -2697,35 +1637,17 @@ jobs:
             graph_swap_used="$(swapon --bytes --noheadings --show=NAME,USED \
               | awk -v path="$GRAPH_SWAP" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
             mem_available_bytes="$(awk '/^MemAvailable:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)"
-            echo "=== GRAPH SWAP RECLAIM PRECHECK: used=${graph_swap_used}B mem_available=${mem_available_bytes}B ==="
-            swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
-            if [[ ! "$graph_swap_used" =~ ^[0-9]+$ ]]; then
-              reclaim_reason='swap-not-active-or-usage-unknown'
-            elif ! swapon --noheadings --show=NAME | grep -Fxq "$BASE_SWAP"; then
-              reclaim_reason='baseline-swap-not-active'
-            elif pgrep -x soong_build >/dev/null 2>&1; then
-              reclaim_reason='soong-still-running'
-            elif (( graph_swap_used > MAX_RECLAIM_USED_BYTES )); then
-              reclaim_reason='more-than-256MiB-swapped'
-            elif (( mem_available_bytes < graph_swap_used + MIN_RAM_MARGIN_BYTES )); then
-              reclaim_reason='insufficient-RAM-margin'
-            else
-              # 90-second cap avoids unbounded stalls; swapoff remains best effort.
-              # If interrupted or unsuccessful, the file is preserved.
+            if [[ "$graph_swap_used" =~ ^[0-9]+$ ]] && \
+               swapon --noheadings --show=NAME | grep -Fxq "$BASE_SWAP" && \
+               ! pgrep -x soong_build >/dev/null 2>&1 && \
+               (( graph_swap_used <= MAX_RECLAIM_USED_BYTES )) && \
+               (( mem_available_bytes >= graph_swap_used + MIN_RAM_MARGIN_BYTES )); then
               if sudo timeout --signal=TERM --kill-after=10s 90s swapoff "$GRAPH_SWAP"; then
-                reclaim_rc=0
-              else
-                reclaim_rc=$?
-              fi
-              if (( reclaim_rc == 0 )) \
-                 && ! swapon --noheadings --show=NAME | grep -Fxq "$GRAPH_SWAP"; then
-                sudo rm -f -- "$GRAPH_SWAP"
-                reclaim_result='reclaimed'
-                reclaim_reason='swapoff-success'
-                echo 'Graph-only swap deactivated and unlinked after safety checks.'
-              else
-                reclaim_reason="swapoff-failed-or-timeout-rc-${reclaim_rc}"
-                echo "::warning::Swapoff did not safely complete (rc=$reclaim_rc); retained graph swap file."
+                if ! swapon --noheadings --show=NAME | grep -Fxq "$GRAPH_SWAP"; then
+                  sudo rm -f -- "$GRAPH_SWAP"
+                  reclaim_result='reclaimed'
+                  reclaim_reason='swapoff-success'
+                fi
               fi
             fi
           fi
@@ -2737,23 +1659,13 @@ jobs:
             printf 'disk_free_before_bytes=%s\ndisk_free_after_bytes=%s\nreclaimed_disk_bytes=%s\n' \
               "$free_disk_before" "$free_disk_after" "$freed_disk_bytes"
           } | tee "$RECLAIM_STATUS"
-          if [ "$reclaim_result" != reclaimed ]; then
-            echo "::warning::Graph-only swap retained: $reclaim_reason. The 8-GiB file may constrain the ROM build."
-          fi
-          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
-          df -h /home/runner/work/los
+
           mark_stage safe-git-objects-cleanup
-          echo '=== LOCKED MANIFEST + CONTROLLED GIT STORAGE RECLAIM ==='
           LOCK=/tmp/rbe-test/source-manifest-locked.xml
           test -s "$LOCK"
           sha256sum -c /tmp/rbe-test/source-manifest-locked.sha256
-          # Capture local CI-only changes not represented by pinned commit hashes.
-          git -C build/soong diff -- cmd/soong_build/main.go             > /tmp/rbe-test/soong-gc-direct.patch || true
-          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc             > /tmp/rbe-test/sonivox-fix.patch || true
-          git -C kernel/samsung/exynos9810 diff -- kernel/bpf/hashtab.c > /tmp/rbe-test/kernel-bpf-nullslists.patch || true
-          # Preserve the exact repo implementation; do not replace it with an
-          # empty or fabricated manifest. Only redirect the one manifest query
-          # to the real locked snapshot after deleting Git object packs.
+          git -C build/soong diff -- cmd/soong_build/main.go > /tmp/rbe-test/soong-gc-direct.patch || true
+          git -C external/sonivox diff -- arm-wt-22k/lib_src/ARM_synth_constants_gnu.inc > /tmp/rbe-test/sonivox-fix.patch || true
           if [ "${SAFE_GIT_OBJECT_TRIM}" = "1" ]; then
             REAL=.repo/repo/repo
             test -s "$REAL"
@@ -2770,7 +1682,6 @@ jobs:
           import os, sys
           from pathlib import Path
           args=sys.argv[1:]
-          # Return the ORIGINAL pinned manifest, never an empty placeholder.
           if args and args[0]=='manifest' and '-r' in args and all(
              a in ('manifest','-r','--revision-as-HEAD','-o','-') or a.endswith('.xml')
              for a in args):
@@ -2788,12 +1699,8 @@ jobs:
           exe.write_text(code)
           exe.chmod(0o755)
           PYREPOBRIDGE
-            # Verify the exact repo command previously failing in build-manifest.
             python3 "$REAL" manifest -r > /tmp/rbe-test/manifest-wrapper-probe.xml
             cmp -s "$LOCK" /tmp/rbe-test/manifest-wrapper-probe.xml
-            echo 'Real locked manifest returned by repo manifest -r compatibility shim.'
-            # Worktree remains unchanged; deleting the Git object stores can
-            # disable regular Git commands for these projects. No sync follows.
             cat > /tmp/rbe-test/git-trim-targets.txt <<'EOFTRIMTARGETS'
           .repo/project-objects/platform/prebuilts/rust.git
           .repo/project-objects/platform/prebuilts/gradle-plugin.git
@@ -2802,66 +1709,33 @@ jobs:
           .repo/project-objects/platform/external/deqp.git
           EOFTRIMTARGETS
             if [ "${SAFE_GIT_EXTENDED_TRIM:-0}" = 1 ]; then
-              # These directories are Git object stores, not working-tree files.
-              # Risk: later `git` commands for these projects will not function.
               cat >> /tmp/rbe-test/git-trim-targets.txt <<'EOFTRIMEXT'
           .repo/project-objects/platform/prebuilts/misc.git
           .repo/project-objects/platform/prebuilts/clang/host/linux-x86.git
           EOFTRIMEXT
             fi
-            ROOT_BEFORE="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
-            IMAGE_BEFORE="$(stat -c '%b %B' "$BTRFS_BACKING" 2>/dev/null || echo '0 0')"
-            printf 'target\tlogical_bytes_before\tstatus\n' > /tmp/rbe-test/git-cleanup-sizes.tsv
             while IFS= read -r candidate; do
               [ -n "$candidate" ] || continue
-              # Exact allowlist. No dynamic paths and never delete .repo/repo.
               case "$candidate" in
                 .repo/project-objects/platform/prebuilts/abi-dumps|.repo/project-objects/platform/prebuilts/rust.git|.repo/project-objects/platform/prebuilts/gradle-plugin.git|.repo/project-objects/platform/prebuilts/sdk.git|.repo/project-objects/LineageOS/android_cts.git|.repo/project-objects/platform/external/deqp.git|.repo/project-objects/platform/prebuilts/misc.git|.repo/project-objects/platform/prebuilts/clang/host/linux-x86.git) ;;
                 *) echo "::error::Refusing unexpected Git trim path: $candidate"; exit 1 ;;
               esac
-              if [ -L "$candidate" ]; then
-                echo "Skip symlink: $candidate"
-                continue
-              fi
-              if [ -d "$candidate" ]; then
-                kib="$(du -sk "$candidate" | awk '{print $1}')"
-                printf '%s\t%s\tremoved\n' "$candidate" "$((kib*1024))" >> /tmp/rbe-test/git-cleanup-sizes.tsv
-                echo "Removing Git object-only directory: $candidate ($(($kib/1024)) MiB logical)"
+              if [ ! -L "$candidate" ] && [ -d "$candidate" ]; then
                 rm -rf -- "$candidate"
-              else
-                printf '%s\t0\tabsent\n' "$candidate" >> /tmp/rbe-test/git-cleanup-sizes.tsv
               fi
             done < /tmp/rbe-test/git-trim-targets.txt
-            # abi-dumps has subprojects; remove only its direct *.git dirs.
-            find .repo/project-objects/platform/prebuilts/abi-dumps -mindepth 1               -maxdepth 1 -type d -name '*.git' -print0 2>/dev/null               | while IFS= read -r -d '' d; do
-                  du -sk "$d" || true
-                  rm -rf -- "$d"
-                done || true
-            ROOT_AFTER="$(df -B1 --output=avail / | tail -n1 | tr -d ' ')"
-            echo "host_free_delta_after_git_delete_bytes=$((ROOT_AFTER-ROOT_BEFORE))"               | tee /tmp/rbe-test/git-storage-delta.txt
-            echo "btrfs_image_allocated_before_blocks_and_blocksize=$IMAGE_BEFORE"               >> /tmp/rbe-test/git-storage-delta.txt
-            stat -c 'btrfs_image_after_blocks=%b blocksize=%B' "$BTRFS_BACKING"               >> /tmp/rbe-test/git-storage-delta.txt 2>/dev/null || true
-            sha256sum -c /tmp/rbe-test/source-manifest-locked.sha256
-          else
-            echo 'SAFE_GIT_OBJECT_TRIM=0: preserving Git metadata.'
+            find .repo/project-objects/platform/prebuilts/abi-dumps -mindepth 1 \
+              -maxdepth 1 -type d -name '*.git' -exec rm -rf -- {} + 2>/dev/null || true
           fi
-          # fstrim works only if discard passes through the mounted loop and
-          # backing filesystem. A no-op/failure must never fail the ROM build.
           if (( BTRFS_ACTIVE == 1 )); then
-            echo '=== OPTIONAL POST-CLEANUP BTRFS DISCARD ==='
-            du -h "$BTRFS_BACKING" || true
-            lsblk -D | head -n 20 || true
-            sudo timeout 90s fstrim -v "$ANDROID_BUILD_TOP"               > /tmp/rbe-test/btrfs-fstrim.log 2>&1 || true
-            du -h "$BTRFS_BACKING" || true
+            sudo timeout 90s fstrim -v "$ANDROID_BUILD_TOP" \
+              > /tmp/rbe-test/btrfs-fstrim.log 2>&1 || true
           fi
-          echo '=== STORAGE AFTER GIT OBJECTS CLEANUP ==='
           df -h / /home/runner/work/los
           enforce_initial_disk_guard post-graph
 
           BUILD_NINJA="$ANDROID_BUILD_TOP/out/combined-${TARGET_PRODUCT}.ninja"
-
           if [ ! -s "$BUILD_NINJA" ]; then
-            echo "::warning::Expected combined ninja was not found at: $BUILD_NINJA"
             BUILD_NINJA="$(
               find "$ANDROID_BUILD_TOP/out" \
                 -maxdepth 1 \
@@ -2870,330 +1744,26 @@ jobs:
                 -print | head -1
             )"
           fi
-
           if [ -z "${BUILD_NINJA:-}" ] || [ ! -s "$BUILD_NINJA" ]; then
             echo "::error::Could not locate the generated combined Ninja graph."
-            find "$ANDROID_BUILD_TOP/out" -maxdepth 2 -type f -name '*.ninja' -print | head -100 || true
             exit 1
           fi
-
           echo "BUILD_NINJA=$BUILD_NINJA" | tee /tmp/rbe-test/build-ninja.txt
 
           mark_stage verify-rbe-graph
           SOONG_NINJA="$ANDROID_BUILD_TOP/out/soong/build.${TARGET_PRODUCT}.ninja"
-          RBE_GRAPH_MATCHES=/tmp/rbe-test/rewrapper-ninja-matches.txt
-          RBE_PROBE_LOG=/tmp/rbe-test/rbe-compile-command.txt
-          RBE_SAMPLE_TARGET_FILE=/tmp/rbe-test/rbe-sample-target.txt
-          echo '=== VERIFY ACTUAL SOONG AND COMBINED NINJA FILES ==='
           if [ ! -s "$SOONG_NINJA" ]; then
             echo "::error::Primary Soong Ninja graph missing: $SOONG_NINJA"
-            find out/soong -maxdepth 1 -name '*ninja' -print || true
             exit 73
           fi
-          test -s "$BUILD_NINJA"
-          stat -c '%n bytes=%s' "$SOONG_NINJA" "$BUILD_NINJA"
-          {
-            printf 'primary_soong_ninja=%s\ncombined_ninja=%s\n' "$SOONG_NINJA" "$BUILD_NINJA"
-            echo '=== References in actual primary Soong graph (diagnostic only) ==='
-            grep -n -m 30 -E 'rewrapper|remoteexecution-client|RBE_' "$SOONG_NINJA" || true
-          } > "$RBE_GRAPH_MATCHES"
-          sed -n '1,35p' "$RBE_GRAPH_MATCHES"
-
-          # ninja -t commands expands variables and includes subninja references.
-          # Only a C/C++ *compile command* using rewrapper is a valid pass.
-          # Stream target inventory: never load the huge graph/target list in RAM.
-          echo '=== VERIFY EXPANDED LIBBASE C/C++ COMMAND ==='
-          cat > /tmp/rbe-test/rbe_graph_probe.py <<'PYRBEGRAPH'
-          #!/usr/bin/env python3
-          """Lightweight Ninja graph probe for Android libbase remote C/C++ compilation.
-          
-          Runs ninja query tools only: never compiles anything.
-          """
-          import pathlib
-          import re
-          import subprocess
-          import sys
-          
-          
-          def is_wrapped_command(command):
-              return bool(
-                  re.search(r"(?:^|[\s;/])(?:[^\s;]*/)?rewrapper(?=[\s;]|$)", command)
-                  and re.search(r"(?:clang\+\+|\bclang\b|\bg\+\+\b|\bgcc\b)", command)
-                  and re.search(r"--exec_strategy=(?:\"?remote\"?)(?=[\s;]|$)", command)
-              )
-          
-          
-          def post_build(graph, report, target_file):
-              folder = pathlib.Path("out/soong/.intermediates/system/libbase/libbase")
-              chosen = target_file.read_text().strip() if target_file.exists() else ""
-              built = []
-              if chosen and pathlib.Path(chosen).is_file() and pathlib.Path(chosen).stat().st_size:
-                  built.append(pathlib.Path(chosen))
-              if folder.is_dir():
-                  for target in folder.rglob("*.o"):
-                      if target.is_file() and target.stat().st_size and target not in built:
-                          built.append(target)
-                          if len(built) >= 20:
-                              break
-              for file in built:
-                  command = subprocess.run(
-                      ["ninja", "-f", str(graph), "-t", "commands", "-s", str(file)],
-                      capture_output=True, text=True, errors="replace", timeout=120,
-                  )
-                  if command.returncode == 0 and is_wrapped_command(command.stdout.strip()):
-                      with report.open("a") as f:
-                          f.write("\npost_build_verdict=PASS_WRAPPED_OBJECT_BUILT\n")
-                          f.write("post_build_proof_object=" + str(file) + "\n")
-                          f.write("post_build_proof_bytes=" + str(file.stat().st_size) + "\n")
-                      target_file.write_text(str(file) + "\n")
-                      print("Confirmed actual compiled object with rewrapper command: " + str(file))
-                      return 0
-              with report.open("a") as f:
-                  f.write("\nERROR=no compiled libbase C/C++ object with expanded rewrapper command\n")
-              return 73
-          
-          
-          def main():
-              graph = pathlib.Path(sys.argv[1])
-              report = pathlib.Path(sys.argv[2])
-              target_file = pathlib.Path(sys.argv[3])
-              if len(sys.argv) > 4 and sys.argv[4] == "post-build":
-                  return post_build(graph, report, target_file)
-              out = []
-              preferred_targets = []
-              other_android_targets = []
-              fallback_targets = []
-              proc = subprocess.Popen(
-                  ["ninja", "-f", str(graph), "-t", "targets", "all"],
-                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                  errors="replace", bufsize=1,
-              )
-              for line in proc.stdout:
-                  if not line.startswith("out/soong/.intermediates/system/libbase/libbase/"):
-                      continue
-                  target = line.partition(": ")[0]
-                  if target.endswith(".o"):
-                      if "android_arm64" in target:
-                          if len(preferred_targets) < 32:
-                              preferred_targets.append(target)
-                      elif "/android_" in target:
-                          if len(other_android_targets) < 16:
-                              other_android_targets.append(target)
-                      elif len(fallback_targets) < 16:
-                          fallback_targets.append(target)
-                      if len(preferred_targets) >= 32:
-                          break
-              if len(preferred_targets) >= 32:
-                  proc.terminate()
-                  try:
-                      proc.communicate(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      proc.kill()
-                      proc.communicate()
-              else:
-                  _, err = proc.communicate()
-                  if proc.returncode:
-                      report.write_text("ninja -t targets all failed: " + err[-2000:] + "\n")
-                      return 73
-          
-              candidate_targets = preferred_targets + other_android_targets + fallback_targets
-              out.append("candidates_collected=" + str(len(candidate_targets)))
-              matched = None
-              for target in candidate_targets[:20]:
-                  result = subprocess.run(
-                      ["ninja", "-f", str(graph), "-t", "commands", "-s", target],
-                      capture_output=True, text=True, errors="replace", timeout=120,
-                  )
-                  if result.returncode:
-                      out.append("query_error=" + target + " rc=" + str(result.returncode)
-                                 + " stderr=" + result.stderr[-500:].replace("\n", " "))
-                      continue
-                  # Ninja expands variables; a literal mention of a rewrapper *path*
-                  # in a file is not evidence that a compiler action runs through it.
-                  cmd = result.stdout.strip()
-                  if is_wrapped_command(cmd):
-                      matched = (target, cmd)
-                      break
-                  out.append("not_remote=" + target + " snippet=" + cmd[:200].replace("\n", " "))
-              if not matched:
-                  out.append("ERROR: no libbase C/C++ compile command actually uses rewrapper")
-                  out.append("Inspected an expanded Ninja command, not just text matches.")
-                  report.write_text("\n".join(out) + "\n")
-                  return 73
-          
-              target, command = matched
-              target_file.write_text(target + "\n")
-              out.extend([
-                  "selected_target=" + target,
-                  "remote_strategy_expected=remote",
-                  "ninja_expanded_command=" + command[:20000],
-                  "verdict=PASS_EXPANDED_LIBBASE_CXX_COMMAND_USES_REWRAPPER",
-              ])
-              report.write_text("\n".join(out) + "\n")
-              print("Verified rewrapper in expanded C/C++ build command: " + target)
-              return 0
-          
-          
-          if __name__ == "__main__":
-              try:
-                  sys.exit(main())
-              except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                  pathlib.Path(sys.argv[2]).write_text("probe_exception=" + str(exc) + "\n")
-                  print("RBE command probe failed: " + str(exc), file=sys.stderr)
-                  sys.exit(73)
-          PYRBEGRAPH
-          if ! python3 /tmp/rbe-test/rbe_graph_probe.py \
-            "$BUILD_NINJA" "$RBE_PROBE_LOG" "$RBE_SAMPLE_TARGET_FILE"; then
-            cat "$RBE_PROBE_LOG" || true
-            echo '::error::No executable libbase C/C++ command routed through rewrapper.'
-            exit 73
-          fi
-          sed -n '1,8p' "$RBE_PROBE_LOG"
-          echo '=== VERIFY CLANG DWARF LEVEL IN REAL RBE COMPILE COMMAND ==='
-          python3 - "$RBE_PROBE_LOG" "$CLANG_DEFAULT_DEBUG_LEVEL" <<'PYDWARF'
-          import pathlib,re,sys
-          content=pathlib.Path(sys.argv[1]).read_text(errors='replace')
-          mode=sys.argv[2]
-          wanted={'debug_level_0':'-g0','debug_level_1':'-g1','debug_level_g':'-g'}[mode]
-          observed=re.findall(r'(?<!\S)-g(?:[0123])?(?!\S)',content)
-          with pathlib.Path('/tmp/rbe-test/dwarf-ninja-verification.txt').open('w') as out:
-              out.write(f'mode={mode} wanted={wanted} observed={observed[:30]}\n')
-          # A compile may use a later module-specific -g override; do not claim
-          # this one representative libbase command proves all modules are optimized.
-          if wanted not in observed:
-              raise SystemExit(f'DWARF setting {wanted} is missing in libbase Ninja compile sample; check Soong propagation')
-          print(f'DWARF_NINJA_PROBE_PASSED mode={mode} flags={observed[:10]}')
-          PYDWARF
-          echo '=== PINNED RECLIENT OUTPUT PATH CHECK ==='
-          cat /tmp/rbe-test/reclient-version.txt
-          test -x "$RBE_DIR/rewrapper"
-          test -x "$RBE_DIR/reproxy"
-          test -x "$RBE_DIR/scandeps_server"
-          # Explicitly refuse local fallback for the proof run.
           if [ "${RBE_CXX_EXEC_STRATEGY:-}" != remote ]; then
             echo '::error::Remote-only C/C++ strategy is required for this trial.'
             exit 73
           fi
 
-          # Compile libbase through the normal Soong/m entry point so that
-          # Soong manages the reproxy socket lifecycle correctly. Do NOT call
-          # Ninja standalone after m nothing: its previous reproxy has stopped.
-          mark_stage rbe-libbase-smoke
-          enforce_initial_disk_guard pre-rbe-libbase-smoke
-          echo '=== LIBBASE REAL REMOTE COMPILE SMOKE ==='
-          run_monitored_m rbe-libbase-smoke libbase \
-            /tmp/rbe-test/rbe-libbase-smoke.log \
-            /tmp/rbe-test/rbe-libbase-exit-code.txt \
-            /tmp/rbe-test/rbe-libbase-disk-stop-triggered.txt \
-            /tmp/rbe-test/rbe-libbase-time-stop-triggered.txt
-          if [ "$MONITORED_RC" -ne 0 ]; then
-            echo '=== STANDALONE CLANG SCANNER / RBE FAILURE SIGNATURES ==='
-            {
-              echo "reclient_version=$(tr -d '\r\n' < "$RBE_DIR/version.txt")"
-              echo "depsscanner_address=${RBE_depsscanner_address}"
-              grep -anE -m 80 \
-                'ClangScanDeps|scandeps_server|processing inputs failed|failed to get dependencies|unsupported argument|ftrivial-auto-var-init|LOCAL_ERROR|UNAUTHENTICATED|PERMISSION_DENIED|UNAVAILABLE|DeadlineExceeded' \
-                /tmp/rbe-test/rbe-libbase-smoke.log \
-                /tmp/rbe-test/reproxy.INFO /tmp/rbe-test/reproxy.ERROR 2>/dev/null \
-                | cut -c 1-400 || true
-            } > /tmp/rbe-test/rbe-scanner-smoke-diagnostics.txt
-            tail -n 100 /tmp/rbe-test/rbe-scanner-smoke-diagnostics.txt || true
-            tail -n 180 /tmp/rbe-test/rbe-libbase-smoke.log || true
-            echo "::error::libbase remote compilation failed (exit $MONITORED_RC); see scanner diagnostics."
-            exit "$MONITORED_RC"
-          fi
-          # Confirm one .o actually produced by this libbase smoke is also a
-          # Ninja-expanded rewrapper/clang command (not merely a graph string).
-          if ! python3 /tmp/rbe-test/rbe_graph_probe.py             "$BUILD_NINJA" "$RBE_PROBE_LOG" "$RBE_SAMPLE_TARGET_FILE" post-build; then
-            tail -n 50 "$RBE_PROBE_LOG" || true
-            echo '::error::libbase built, but no produced C/C++ object proved remote rewrapper execution.'
-            exit 73
-          fi
-          RBE_SAMPLE_TARGET="$(cat "$RBE_SAMPLE_TARGET_FILE")"
-          {
-            echo 'status=PASS'
-            echo 'target_module=libbase'
-            echo "compiled_object=$RBE_SAMPLE_TARGET"
-            echo "compiled_object_bytes=$(stat -c %s "$RBE_SAMPLE_TARGET")"
-            echo 'cxx_execution_strategy=remote'
-            echo "reclient_version=$(tr -d '\r\n' < "$RBE_DIR/version.txt")"
-            echo "depsscanner_address=${RBE_depsscanner_address}"
-            echo 'expanded_cxx_command_uses_rewrapper=true'
-            echo 'libbase_build_exit_code=0'
-            echo 'note=Successful remote-only libbase smoke and on-disk C++ object with matching expanded rewrapper command. Server-side BuildBuddy metrics not independently queried.'
-          } | tee /tmp/rbe-test/rbe-libbase-verification.txt
-          echo '=== RBE SMOKE LOG STATS ==='
-          grep -aE 'RBE Stats:|Downloaded:|Uploaded:' \
-            /tmp/rbe-test/rbe-libbase-smoke.log | tail -n 25 || true
-          echo '=== RBE METRICS DIAGNOSTIC ==='
-          grep -aE 'action_counts|num_remote|remote_ex|num_records' \
-            /tmp/rbe-test/rbe_metrics.txt | tail -n 30 || true
-
-          # Run Sonivox through actual Soong/RBE early, not 74 minutes into
-          # the ROM build. This checks the assembler path, not just Clang -E.
-          mark_stage rbe-sonivox-smoke
-          echo '=== SONIVOX ARM/RBE COMPILE SMOKE ==='
-          run_monitored_m rbe-sonivox-smoke libsonivox \
-            /tmp/rbe-test/rbe-sonivox-smoke.log \
-            /tmp/rbe-test/rbe-sonivox-exit-code.txt \
-            /tmp/rbe-test/rbe-sonivox-disk-stop-triggered.txt \
-            /tmp/rbe-test/rbe-sonivox-time-stop-triggered.txt
-          if [ "$MONITORED_RC" -ne 0 ]; then
-            echo '=== SONIVOX SCANNER / ASSEMBLER ERRORS ==='
-            grep -anE -m 80 'ARM_synth_constants_gnu|#endif without #if|ARM-E_filter_gnu|ARM-E_mastergain_gnu|processing inputs failed|error:' \
-              /tmp/rbe-test/rbe-sonivox-smoke.log | cut -c 1-450 \
-              > /tmp/rbe-test/sonivox-smoke-errors.txt || true
-            tail -n 100 /tmp/rbe-test/sonivox-smoke-errors.txt || true
-            echo "::error::Sonivox did not compile (exit $MONITORED_RC); build ROM not started."
-            exit "$MONITORED_RC"
-          fi
-          echo 'SONIVOX_RBE_SMOKE_PASSED' | tee /tmp/rbe-test/sonivox-smoke-result.txt
-
-          # Build the *exact Ninja kernel Image target* that failed around
-          # 92% of the prior full ROM build. This uses the standard m/Soong
-          # path and writes the SAME Image file, so bacon can reuse it.
-          # Unlike a compiler-only toy test, this covers real Kbuild/config.
-          mark_stage kernel-image-smoke
-          KERNEL_IMAGE_TARGET=out/target/product/star2lte/obj/KERNEL_OBJ/arch/arm64/boot/Image
-          echo "=== KERNEL IMAGE EARLY SMOKE: $KERNEL_IMAGE_TARGET ==="
-          echo 'Checking exact target in generated combined Ninja graph.'
-          if ! ninja -f "$BUILD_NINJA" -t query "$KERNEL_IMAGE_TARGET" \
-               > /tmp/rbe-test/kernel-target-query.txt 2>&1; then
-            cat /tmp/rbe-test/kernel-target-query.txt || true
-            echo '::error::Kernel Image target missing in Ninja graph; cannot claim a valid smoke test.'
-            exit 74
-          fi
-          echo '=== BUILD REAL KERNEL IMAGE BEFORE FULL ROM ==='
-          enforce_initial_disk_guard pre-kernel-image-smoke
-          run_monitored_m kernel-image-smoke "$KERNEL_IMAGE_TARGET" \
-            /tmp/rbe-test/kernel-image-smoke.log \
-            /tmp/rbe-test/kernel-image-exit-code.txt \
-            /tmp/rbe-test/kernel-image-disk-stop-triggered.txt \
-            /tmp/rbe-test/kernel-image-time-stop-triggered.txt
-          if [ "$MONITORED_RC" -ne 0 ]; then
-            grep -anE -m 100 '(^FAILED:|error:|hashtab.c:|incompatible pointer|ninja failed)' \
-              /tmp/rbe-test/kernel-image-smoke.log | tail -n 100 | cut -c 1-450 \
-              > /tmp/rbe-test/kernel-image-errors.txt || true
-            tail -n 100 /tmp/rbe-test/kernel-image-errors.txt || true
-            echo "::error::Kernel Image smoke failed (exit $MONITORED_RC); ROM build not started."
-            exit "$MONITORED_RC"
-          fi
-          if [ ! -s "$KERNEL_IMAGE_TARGET" ]; then
-            echo '::error::Kernel Image smoke command succeeded but Image is missing or empty.'
-            exit 74
-          fi
-          {
-            echo 'status=PASS'
-            echo "target=$KERNEL_IMAGE_TARGET"
-            echo "image_bytes=$(stat -c %s "$KERNEL_IMAGE_TARGET")"
-            echo 'source_fix=kernel-bpf-nullslists.patch'
-          } | tee /tmp/rbe-test/kernel-image-verification.txt
-          echo 'KERNEL_IMAGE_SMOKE_PASSED'
-
           mark_stage pre-build
           echo "=== FULL ROM BUILD: star2lte / bacon ==="
-          echo "RBE remote-only enabled; jobs=2, highmem=1, no local ccache."
-          echo "libbase, Sonivox and the real kernel Image smoke passed; bacon reuses these outputs."
+          echo "RBE remote-only enabled; local jobs=$(nproc), remote=${NINJA_REMOTE_NUM_JOBS}, highmem=1, no local ccache."
           enforce_initial_disk_guard pre-build
 
           if (( $(date +%s) >= SOFT_DEADLINE_EPOCH )); then
@@ -3215,14 +1785,12 @@ jobs:
             tail -n 200 "$BUILD_LOG" 2>/dev/null || true
             echo '=== REPROXY STDERR TAIL ==='
             tail -n 100 /tmp/rbe-test/reproxy_outerr.log 2>/dev/null || true
-            echo "::error::Full ROM build did not complete (exit $BUILD_RC). See attached diagnostics."
+            echo "::error::Full ROM build did not complete (exit $BUILD_RC)."
             exit "$BUILD_RC"
           fi
 
           mark_stage verify-rom-zip
-          # A successful Ninja exit alone is not enough: verify flashable ZIP.
           ROM_DIR="$ANDROID_BUILD_TOP/out/target/product/star2lte"
-          echo "=== ROM OUTPUT DIRECTORY ==="
           ls -lah "$ROM_DIR" | tail -n 45
           mapfile -d '' -t ROM_ZIPS < <(find "$ROM_DIR" -maxdepth 1 -type f -name 'lineage-*.zip' -print0)
           if (( ${#ROM_ZIPS[@]} == 0 )); then
@@ -3236,13 +1804,10 @@ jobs:
           test -s "$ROM_ZIP"
           echo "ROM_ZIP=$ROM_ZIP"
           ls -lh "$ROM_ZIP"
-          echo "=== CHECK ROM ZIP INTEGRITY ==="
           unzip -tq "$ROM_ZIP" | tail -n 8
           sha256sum "$ROM_ZIP" | tee /tmp/rbe-test/rom-sha256.txt
           basename "$ROM_ZIP" > /tmp/rbe-test/rom-filename.txt
           echo "=== FULL ROM BUILD PASSED ==="
-          echo "Lineage product: ${TARGET_PRODUCT}-${TARGET_RELEASE}-${TARGET_BUILD_VARIANT}"
-          echo 'Full bacon target completed with remote C++ compilation enabled.'
           mark_stage complete
 
       - name: Upload completed LineageOS ROM
@@ -3268,362 +1833,37 @@ jobs:
             echo '| Stage (UTC) | Free GiB | Used GiB | RAM available GiB |'
             echo '|---|---:|---:|---:|'
             if [ -s "$FILE" ]; then
-              # Show first/last rows and build low-watermark; no expensive du.
               awk -F '\t' 'NR>1 && NF>=5 {
                 free=$3/1073741824; used=$4/1073741824; ram=$5/1048576;
                 if (!seen || free<min) {min=free; low=$2 " " $1};
-                if ($2!="build-sample" && $2!="full-rom-sample") printf "| %s: %s | %.1f | %.1f | %.1f |\n",$2,$1,free,used,ram;
+                if ($2 !~ /-sample$/) printf "| %s: %s | %.1f | %.1f | %.1f |\n",$2,$1,free,used,ram;
                 seen=1
               } END {
                 if(seen) printf "\nLowest observed free disk: **%.1f GiB** at %s.\n",min,low;
-                else print "No storage samples recorded."
               }' "$FILE"
-            else
-              echo '| No measurements | — | — | — |'
             fi
             echo ''
-            echo "Disk guard: warning under ${DISK_WARN_GIB} GiB; safe stop under ${DISK_STOP_GIB} GiB."
-            echo "Workspace: **${WORKSPACE_STORAGE}**; Ninja remote=${NINJA_REMOTE_NUM_JOBS}, local=2, highmem=${NINJA_HIGHMEM_NUM_JOBS}."
-            if [ -s /tmp/rbe-test/btrfs-storage-samples.tsv ]; then
-              echo '### Btrfs ZSTD host/root accounting'
-              echo '```text'
-              tail -n 8 /tmp/rbe-test/btrfs-storage-samples.tsv
-              echo '```'
-            fi
-            if [ -s /tmp/rbe-test/webview-lfs-check.log ]; then
-              echo '### WebView LFS validation'
-              echo '```text'
-              tail -n 15 /tmp/rbe-test/webview-lfs-check.log
-              echo '```'
-            fi
-            echo "Soong: GOGC=${SOONG_GOGC}; GOMEMLIMIT=${SOONG_GOMEMLIMIT} (Go >=1.19 only); graph GOMAXPROCS=${SOONG_GRAPH_GOMAXPROCS}; gctrace=${SOONG_GRAPH_GC_TRACE}."
-            echo "Graph memory guard: enabled=${GRAPH_MEM_GUARD_ENABLED}, RAM<=${GRAPH_MEM_GUARD_RAM_MIB} MiB AND swap<=${GRAPH_MEM_GUARD_SWAP_MIB} MiB for ${GRAPH_MEM_GUARD_SAMPLES} consecutive samples."
-            echo "Hybrid swap requested: ZRAM=${SOONG_ZRAM_GIB}GiB logical; disk=${SOONG_DISK_SWAP_GIB}GiB (post-graph base ${POST_GRAPH_DISK_SWAP_GIB}GiB)."
-            echo '### Soong Go/runtime verification'
-            if [ -s /tmp/rbe-test/soong-go-runtime.txt ]; then
-              echo '```text'
-              cat /tmp/rbe-test/soong-go-runtime.txt
-              echo '```'
-            fi
-            if [ -s /tmp/rbe-test/soong-build-binary-go-version.txt ]; then
-              echo '```text'
-              cat /tmp/rbe-test/soong-build-binary-go-version.txt
-              echo '```'
-            fi
-            if [ -s /tmp/rbe-test/soong-memory-samples.tsv ]; then
-              awk -F '\t' 'NR > 1 && NF >= 14 {
-                if($5 > maxrss) maxrss=$5;
-                if($7 > maxswap) maxswap=$7;
-                if($3 > 0 && (minram == 0 || $3 < minram)) minram=$3;
-                if($14 != "na" && $14 != "" && $14+0 > maxkill) maxkill=$14+0
-              } END {
-                printf "Peak sampled soong_build RSS: **%.2f GiB**; VmSwap: **%.2f GiB**; lowest available RAM: **%.2f GiB**.\n", maxrss/1048576, maxswap/1048576, minram/1048576;
-                printf "Maximum sampled cgroup oom_kill counter: **%d** (check baseline for changes).\n", maxkill
-              }' /tmp/rbe-test/soong-memory-samples.tsv
-            fi
-            if [ -s /tmp/rbe-test/graph-memory-stop-triggered.txt ]; then
-              echo '**Soong graph proactively stopped due to sustained low RAM AND low swap.**'
-              echo '```text'
-              cat /tmp/rbe-test/graph-memory-stop-triggered.txt
-              echo '```'
-            fi
-            if [ -s /tmp/rbe-test/soong-gc-trace-tail.log ]; then
-              echo '### Last Go GC traces from graph (may include multiple Go processes)'
-              echo '```text'
-              tail -n 12 /tmp/rbe-test/soong-gc-trace-tail.log
-              echo '```'
-            fi
-            if [ -s /tmp/rbe-test/soong-process-samples.tsv ]; then
-              echo '### Recent Soong PID / CPU / RSS samples'
-              echo '```text'
-              tail -n 8 /tmp/rbe-test/soong-process-samples.tsv
-              echo '```'
-            fi
-            for status in /tmp/rbe-test/zram-status.txt /tmp/rbe-test/swap-status.txt /tmp/rbe-test/graph-swap-reclaim.txt; do
-              if [ -s "$status" ]; then
-                echo '```text'
-                echo "$(basename "$status")"
-                cat "$status"
-                echo '```'
-              fi
-            done
-            if [ -s /tmp/rbe-test/disk-stop-triggered.txt ]; then
-              echo '**Guard triggered: build terminated due to low disk.**'
-            fi
-            echo ''
-            echo '### Prebuilts: largest directories (post-sync)'
-            if [ -s /tmp/rbe-test/prebuilts-size.log ]; then
-              echo '```text'
-              tail -n 16 /tmp/rbe-test/prebuilts-size.log
-              echo '```'
-            else
-              echo 'No prebuilts breakdown was captured.'
-            fi
-            echo ''
-            echo '### Git repo metadata: largest directories (post-sync)'
-            if [ -s /tmp/rbe-test/repo-size.log ]; then
-              echo '```text'
-              tail -n 12 /tmp/rbe-test/repo-size.log
-              echo '```'
-            else
-              echo 'No .repo breakdown was captured.'
-            fi
-            echo ''
-            echo '### Clang toolchains: largest paths'
-            if [ -s /tmp/rbe-test/clang-detail.log ]; then
-              echo '```text'
-              tail -n 18 /tmp/rbe-test/clang-detail.log
-              echo '```'
-            else
-              echo 'No Clang deep profile was captured.'
-            fi
-            echo ''
-            echo '### Gradle plugin: largest paths'
-            if [ -s /tmp/rbe-test/gradle-detail.log ]; then
-              echo '```text'
-              tail -n 10 /tmp/rbe-test/gradle-detail.log
-              echo '```'
-            else
-              echo 'No Gradle deep profile was captured.'
-            fi
-            echo ''
-            echo '### Platform Git objects: largest paths'
-            if [ -s /tmp/rbe-test/platform-objects-detail.log ]; then
-              echo '```text'
-              tail -n 16 /tmp/rbe-test/platform-objects-detail.log
-              echo '```'
-            else
-              echo 'No platform Git-object deep profile was captured.'
-            fi
-            echo ''
-            if [ -s /tmp/rbe-test/prebuilts-projects.log ]; then
-              echo "Prebuilts projects listed in manifest: **$(wc -l < /tmp/rbe-test/prebuilts-projects.log)**."
-            else
-              echo 'No prebuilts manifest project list was captured.'
-            fi
-            echo 'Storage profiling did not modify source or Git objects.'
-            echo ''
-            echo '### P1 host-binary / historical ABI worktree trim'
-            if [ -s /tmp/rbe-test/storage-trim-p1.log ]; then
-              echo '```text'
-              grep -E '^(TRIM |SKIP |disk_available_(before|after|delta)_bytes=|P1 trim changes)' \
-                /tmp/rbe-test/storage-trim-p1.log | tail -n 30 || true
-              echo '```'
-            else
-              echo 'P1 trim did not execute.'
-            fi
-            echo ''
-            echo '### P0 reclient trim'
-            if [ -s /tmp/rbe-test/p0-storage-trim-status.txt ]; then
-              cat /tmp/rbe-test/p0-storage-trim-status.txt
-            else
-              echo 'P0 trim did not finish; see diagnostic artifact.'
-            fi
-            if [ -s /tmp/rbe-test/p0-reclient-size.txt ]; then
-              echo '```text'
-              cat /tmp/rbe-test/p0-reclient-size.txt
-              echo '```'
-            fi
-            echo ''
-            echo '### Configure stage (P0.1 diagnostics)'
-            if [ -s /tmp/rbe-test/configure-failure.txt ]; then
-              echo '**The configure/build step exited with an error:**'
-              echo '```text'
-              cat /tmp/rbe-test/configure-failure.txt
-              echo '```'
-            elif [ -s /tmp/rbe-test/configure-success.txt ]; then
-              echo 'Configure/build step completed successfully.'
-            else
-              echo 'Configure/build step did not record a final exit status.'
-            fi
-            if [ -s /tmp/rbe-test/configure-stages.log ]; then
-              echo '```text'
-              tail -n 20 /tmp/rbe-test/configure-stages.log
-              echo '```'
-            fi
-            echo ''
-            echo '### ROM output'
             if [ -s /tmp/rbe-test/rom-filename.txt ]; then
               echo "ROM ZIP: **$(cat /tmp/rbe-test/rom-filename.txt)**"
-              echo ''
               echo '```text'
               cat /tmp/rbe-test/rom-sha256.txt 2>/dev/null || true
               echo '```'
             else
               echo 'No verified ROM ZIP created in this run.'
             fi
-            if [ -s /tmp/rbe-test/time-stop-triggered.txt ] || [ -s /tmp/rbe-test/graph-time-stop-triggered.txt ]; then
-              echo '**Soft job deadline triggered during graph generation or ROM build.**'
-            fi
-            if [ -s /tmp/rbe-test/graph-disk-stop-triggered.txt ]; then
-              echo '**Build graph stopped for low disk space.**'
-            fi
-            if [ -s /tmp/rbe-test/termination-signal.txt ]; then
-              echo '**External termination signal observed:**'
-              echo '```text'
-              cat /tmp/rbe-test/termination-signal.txt
-              echo '```'
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
-          echo '=== FINAL DISK AND MEMORY ==='
-          df -h / /home/runner/work/los || true
-          free -h || true
 
-          echo '=== POST-BUILD OUTPUT STORAGE ==='
-          {
-            date -u +'%Y-%m-%dT%H:%M:%SZ'
-            du -sh /home/runner/work/los/.repo /home/runner/work/los/out \
-              2>/dev/null || true
-            du -xhd1 /home/runner/work/los/out 2>/dev/null \
-              | sort -h | tail -n 35 || true
-          } 2>&1 | tee /tmp/rbe-test/disk-analysis-post-build.log
-
-      - name: RBE diagnostics
+      - name: Finalize RBE metrics after compilation stops
         if: always()
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set +e
-
-          mkdir -p /tmp/rbe-test
-
-          echo "=== SAFE RBE ENV ==="
-          cat /tmp/rbe-test/rbe-env.txt 2>/dev/null || true
-
-          echo '=== CONFIGURE / LUNCH FAILURE SUMMARY ==='
-          cat /tmp/rbe-test/configure-failure.txt 2>/dev/null || true
-          echo '=== CONFIGURE STAGES ==='
-          cat /tmp/rbe-test/configure-stages.log 2>/dev/null || true
-          echo '=== CONFIGURE LOG TAIL (LAST 180 LINES) ==='
-          tail -n 180 /tmp/rbe-test/configure-setup.log 2>/dev/null || true
-
-          echo "=== RBE LOG DIRECTORY ==="
-          find "$(readlink -f /tmp/rbe-test)" \
-            -maxdepth 2 \
-            -type f \
-            -printf '%p %s bytes\n' \
-            | sort | tail -n 80 || true
-
-          echo "=== REPROXY PROCESSES ==="
-          ps aux | grep -E '[r]eproxy|[r]ewrapper|[s]candeps' || true
-
-          echo "=== DISK ==="
-          df -h / /home/runner/work/los || true
-          echo "=== STORAGE PROFILE SAMPLING ==="
-          tail -n 30 /tmp/rbe-test/resource-samples.tsv 2>/dev/null || true
-          echo "=== RESOURCE MONITOR ==="
-          tail -n 60 /tmp/rbe-test/resource-monitor.log 2>/dev/null || true
-
-          echo '=== PREBUILTS LARGEST DIRECTORIES ==='
-          tail -n 25 /tmp/rbe-test/prebuilts-detail.log 2>/dev/null || true
-          echo '=== REPO METADATA LARGEST DIRECTORIES ==='
-          tail -n 25 /tmp/rbe-test/repo-size.log 2>/dev/null || true
-          echo '=== CLANG TOOLCHAINS LARGEST DIRECTORIES ==='
-          tail -n 25 /tmp/rbe-test/clang-detail.log 2>/dev/null || true
-          echo '=== GRADLE PLUGIN LARGEST DIRECTORIES ==='
-          tail -n 15 /tmp/rbe-test/gradle-detail.log 2>/dev/null || true
-          echo '=== PLATFORM GIT OBJECTS LARGEST DIRECTORIES ==='
-          tail -n 25 /tmp/rbe-test/platform-objects-detail.log 2>/dev/null || true
-          echo '=== PREBUILTS MANIFEST PROJECT COUNT ==='
-          wc -l /tmp/rbe-test/prebuilts-projects.log 2>/dev/null || true
-
-          echo "=== REPROXY LOG TAIL ==="
-          tail -n 220 /tmp/rbe-test/reproxy_log.txt 2>/dev/null || true
-
-          echo "=== ALL AVAILABLE RECLIENT LOGS ==="
-          find /tmp/rbe-test -maxdepth 3 -type f \
-            \( -iname '*log*' -o -name '*.rpl' -o -iname '*metrics*' \) \
-            -printf '%p %s bytes\n' | sort || true
-
-          echo "=== RBE ERROR SUMMARY ==="
-          grep -aRinE \
-            'UNAUTHENTICATED|PERMISSION_DENIED|PermissionDenied|Unauthenticated|Unavailable|DeadlineExceeded|InvalidArgument|working_directory|input root|ResourceExhausted|ERROR|FATAL|failed|connection refused|no such file|exec format error' \
-            /tmp/rbe-test \
-            --exclude=full-rom-build.log \
-            --exclude=m-nothing.log \
-            --exclude='*.rrpl' \
-            --exclude='*.rpi' \
-            --exclude='*.INFO*' \
-            --exclude='*.pb' \
-            2>/dev/null | head -100 || true
-
-          echo "=== RBE METRICS ==="
-          cat /tmp/rbe-test/rbe_metrics.txt 2>/dev/null || true
-
-          echo '=== PRIMARY SOONG RUNTIME PATCH ==='
-          cat /tmp/rbe-test/soong-go-runtime-patch.txt 2>/dev/null || true
-          echo '=== SOONG GC HEAP SAMPLES ==='
-          tail -n 30 /tmp/rbe-test/soong-go-heap.tsv 2>/dev/null || true
-          echo '=== PRIMARY SOONG PROCESS ENVIRONMENT (WHITELISTED) ==='
-          cat /tmp/rbe-test/soong-proc-environ.tsv 2>/dev/null || true
-          echo "=== BUILD GRAPH LOG TAIL ==="
-          tail -n 160 /tmp/rbe-test/m-nothing.log 2>/dev/null || true
-
-          echo "=== FULL ROM BUILD LOG TAIL ==="
-          tail -n 260 /tmp/rbe-test/full-rom-build.log 2>/dev/null || true
-          echo "=== BUILD STOP REASONS ==="
-          cat /tmp/rbe-test/*-stop-triggered.txt 2>/dev/null || true
-          echo '=== EXTERNAL TERMINATION SIGNAL ==='
-          cat /tmp/rbe-test/termination-signal.txt 2>/dev/null || true
-          echo '=== HYBRID SWAP STATUS ==='
-          cat /tmp/rbe-test/zram-status.txt /tmp/rbe-test/swap-status.txt \
-            /tmp/rbe-test/graph-swap-reclaim.txt 2>/dev/null || true
-          swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
-          zramctl || true
-          echo '=== MEMORY PRESSURE TAIL ==='
-          tail -n 160 /tmp/rbe-test/memory-pressure.log 2>/dev/null || true
-          echo '=== SOONG GO VERSION AND ACTIVE GC LIMIT ==='
-          cat /tmp/rbe-test/soong-go-runtime.txt 2>/dev/null || true
-          cat /tmp/rbe-test/soong-build-binary-go-version.txt 2>/dev/null || true
-          echo '=== SOONG MEMORY SAMPLES TAIL ==='
-          tail -n 30 /tmp/rbe-test/soong-memory-samples.tsv 2>/dev/null || true
-          echo '=== SOONG PROCESS PID / CPU / RSS SAMPLES TAIL ==='
-          tail -n 30 /tmp/rbe-test/soong-process-samples.tsv 2>/dev/null || true
-          echo '=== GRAPH GC TRACE RECENT LINES ==='
-          tail -n 30 /tmp/rbe-test/soong-gc-trace-tail.log 2>/dev/null || true
-          echo '=== GRAPH MEMORY GUARD DETAIL ==='
-          cat /tmp/rbe-test/graph-memory-stop-triggered.txt 2>/dev/null || true
-          echo '=== CGROUP OOM EVENT BASELINE ==='
-          cat /tmp/rbe-test/cgroup-memory-events-before-graph.txt 2>/dev/null || true
-          echo '=== P1 STORAGE TRIM SUMMARY ==='
-          tail -n 50 /tmp/rbe-test/storage-trim-p1.log 2>/dev/null || true
-          echo '=== SOONG GRAPH EXIT CODE ==='
-          cat /tmp/rbe-test/graph-exit-code.txt 2>/dev/null || true
-          echo "=== ROM ZIP FILES IF PRESENT ==="
-          find /home/runner/work/los/out/target/product/star2lte -maxdepth 1 \
-            -type f -name 'lineage-*.zip' -printf '%p %s bytes\n' 2>/dev/null || true
-
-      - name: Release hybrid swap at job end (best effort)
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          # On a canceled/low-memory runner, swapoff can allocate several GiB
-          # and trigger another OOM. Do not swapoff non-empty swap devices.
-          # Runner is ephemeral; leave in-use devices until VM teardown.
-          for SWAPFILE in /mnt/soong-swap-graph /mnt/soong-swap-base; do
-            if [ ! -f "$SWAPFILE" ]; then continue; fi
-            USED="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$SWAPFILE" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
-            if [ "$USED" = 0 ] && sudo swapoff "$SWAPFILE"; then
-              sudo rm -f "$SWAPFILE"
-              echo "Released unused swap $SWAPFILE"
-            else
-              echo "Retained swap $SWAPFILE used_bytes=$USED (na = unknown; not unlinking)"
-            fi
-          done
-          if [ -s /tmp/rbe-test/zram-device.txt ]; then
-            ZRAM_DEV="$(cat /tmp/rbe-test/zram-device.txt)"
-            USED="$(swapon --bytes --noheadings --show=NAME,USED | awk -v path="$ZRAM_DEV" '$1==path {print $2; found=1; exit} END {if (!found) print "na"}')"
-            if [ "$USED" = 0 ] && sudo swapoff "$ZRAM_DEV"; then
-              sudo zramctl --reset "$ZRAM_DEV" || true
-              echo "Released unused zram $ZRAM_DEV"
-            else
-              echo "Retained zram $ZRAM_DEV used_bytes=$USED"
-            fi
+          test -d /tmp/rbe-test || exit 0
+          if pgrep -x reproxy >/dev/null && [ -x "${RBE_DIR}/bootstrap" ]; then
+            timeout 60s "${RBE_DIR}/bootstrap" -shutdown -output_dir=/tmp/rbe-test \
+              > /tmp/rbe-test/reproxy-finalize.log 2>&1 || true
           fi
-          echo '=== SWAP AFTER SAFE CLEANUP ==='
-          swapon --show || true
-          df -h /
 
       - name: Stop BuildBuddy gRPC bridge and remove credentials
         if: always()
@@ -3635,134 +1875,6 @@ jobs:
             nginx -s quit -c "$CFG" >/dev/null 2>&1 || true
           fi
           rm -rf /tmp/buildbuddy-rbe-bridge
-          echo "BuildBuddy bridge configuration removed."
-
-      - name: Final Soong intermediates profile and ZSTD comparison
-        if: always()
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set +e
-          set -o pipefail
-          DIR="$(readlink -f /tmp/rbe-test 2>/dev/null)"
-          [ -n "$DIR" ] && [ -d "$DIR" ] || exit 0
-          if [ -f "$DIR/soong_storage_probe.py" ]; then
-            timeout 100s python3 "$DIR/soong_storage_probe.py" \
-              out/soong/.intermediates "$DIR" final \
-              >> "$DIR/soong-storage-profile.log" 2>&1 || true
-          fi
-          echo '=== SOONG BIGGEST OUTPUT TYPES ==='
-          head -n 18 "$DIR/soong-size-by-type.tsv" 2>/dev/null || true
-          echo '=== SOONG BIGGEST MODULES ==='
-          head -n 18 "$DIR/soong-size-by-module.tsv" 2>/dev/null || true
-          # ZSTD 1 vs 3 comparison is read-only and bounded (no new image data).
-          # A userspace file ratio is not identical to physical Btrfs extent savings.
-          if command -v zstd >/dev/null && [ -s "$DIR/soong-largest-files.tsv" ]; then
-            printf 'file\traw_bytes\tzstd1_bytes\tzstd3_bytes\n' > "$DIR/soong-zstd-comparison.tsv"
-            count=0
-            while IFS=$'\t' read -r logical blocks rel; do
-              [[ "$logical" =~ ^[0-9]+$ ]] || continue
-              # 0.5 MiB to 32 MiB and only compiler/linker inputs.
-              if (( logical < 524288 || logical > 33554432 )); then continue; fi
-              case "$rel" in *.o|*.a|*.so) ;; *) continue ;; esac
-              file="out/soong/.intermediates/$rel"
-              [ -f "$file" ] || continue
-              if ! b1="$(timeout 12s zstd -q -1 -c -- "$file" | wc -c)"; then continue; fi
-              if ! b3="$(timeout 12s zstd -q -3 -c -- "$file" | wc -c)"; then continue; fi
-              printf '%s\t%s\t%s\t%s\n' "$rel" "$logical" "$b1" "$b3" >> "$DIR/soong-zstd-comparison.tsv"
-              count=$((count+1))
-              (( count >= 12 )) && break
-            done < "$DIR/soong-largest-files.tsv"
-          fi
-          echo '=== HOST BACKING IMAGE AFTER BUILD ==='
-          df -B1 --output=avail / | tail -2
-          stat -c 'image_blocks=%b image_block_size=%B' /tmp/los20-workspace-btrfs.img 2>/dev/null || true
-
-      - name: Final bounded JAR duplicate census (read only)
-        if: always()
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set +e
-          ROOT=out/soong/.intermediates
-          DIR="$(readlink -f /tmp/rbe-test 2>/dev/null)"
-          test -f "$DIR/ci_jar_dedupe.py" && test -d "$ROOT" || exit 0
-          echo '=== FINAL JAR DUPLICATE CENSUS (READ-ONLY) ==='
-          # Skip if another protected dedupe pass is still in progress.
-          (
-            exec 8>"$DIR/jar-dedupe.lock"
-            flock -n 8 || exit 0
-            ionice -c3 nice -n 15 timeout 85s python3 "$DIR/ci_jar_dedupe.py" \
-              --root "$ROOT" --diagnostics "$DIR" --mode probe \
-              --age-minutes 10 --hash-gib 2 --max-files 250
-          ) >> "$DIR/jar-dedupe-worker.log" 2>&1 || true
-          echo '=== JAR DEDUPE SUMMARY ==='
-          tail -n 8 "$DIR/jar-dedupe-runs.tsv" 2>/dev/null | cut -c 1-300 || true
-
-      - name: Finalize RBE metrics after compilation stops
-        if: always()
-        working-directory: /home/runner/work/los
-        shell: bash
-        run: |
-          set +e
-          test -d /tmp/rbe-test || exit 0
-          echo '=== BEST EFFORT REPROXY GRACEFUL SHUTDOWN ==='
-          # All m/ninja commands have exited. bootstrap -shutdown flushes stats.
-          if pgrep -x reproxy >/dev/null && [ -x "${RBE_DIR}/bootstrap" ]; then
-            timeout 60s "${RBE_DIR}/bootstrap" -shutdown -output_dir=/tmp/rbe-test \
-              > /tmp/rbe-test/reproxy-finalize.log 2>&1
-            RC=$?
-            echo "bootstrap_shutdown_rc=$RC"
-          fi
-          if pgrep -x reproxy >/dev/null; then
-            echo '::warning::reproxy is still active: active logs will remain untouched.'
-          fi
-          ls -lh /tmp/rbe-test/rbe_metrics* 2>/dev/null || true
-
-      - name: Compact inactive reproxy logs while retaining failures
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          DIR="$(readlink -f /tmp/rbe-test)"
-          test -d "$DIR" || exit 0
-          echo '=== BEFORE RBE LOG COMPACTION (REAL DIRECTORY) ==='
-          du -sh "$DIR" || true
-          # Do not mutate live reproxy logs, or consume active .rrpl during shutdown.
-          if pgrep -x reproxy >/dev/null 2>&1; then
-            echo '::warning::reproxy still running; skip compaction to protect metrics.'
-            exit 0
-          fi
-          python3 - "$DIR" "$RBE_INFO_KEEP_MIB" "$RBE_RRPL_KEEP_MIB" <<'PYCLEAN'
-          import pathlib,sys,os
-          root=pathlib.Path(sys.argv[1]); tail=int(sys.argv[2])*1024*1024
-          rrpl_limit=int(sys.argv[3])*1024*1024
-          summary=[]
-          for file in root.iterdir():
-              if not file.is_file() or file.is_symlink(): continue
-              name=file.name; size=file.stat().st_size
-              # Keep ERROR/WARNING/metrics and the last portion of huge INFO logs.
-              if (name.startswith(('reproxy.','bootstrap.','reproxy_')) and
-                  ('.INFO.' in name or name.endswith('.INFO')) and size > 2*tail):
-                  with file.open('rb') as src:
-                      src.seek(-tail,os.SEEK_END); data=src.read(tail)
-                  tmp=file.with_name(name+'.compact')
-                  tmp.write_bytes(data)
-                  os.replace(tmp,file)
-                  summary.append((name,size,len(data),'tail-kept'))
-              elif name.startswith('reproxy_') and name.endswith('.rrpl') and size>rrpl_limit:
-                  # Only discard oversized action logs once final metrics exist.
-                  if (root/'rbe_metrics.txt').is_file() and (root/'rbe_metrics.pb').is_file():
-                      file.unlink()
-                      summary.append((name,size,0,'removed-post-metrics'))
-          report=root/'rbe-log-compaction.tsv'
-          report.write_text('file\tbefore_bytes\tafter_bytes\tstatus\n'+''.join(
-              f'{name}\t{old}\t{new}\t{state}\n' for name,old,new,state in summary))
-          print(f'Compacted {len(summary)} files')
-          PYCLEAN
-          echo '=== AFTER RBE LOG COMPACTION ==='
-          du -sh "$DIR" || true
-          df -h /
 
       - name: Stage bounded, explicit diagnostic artifact
         id: stage_diagnostics
@@ -3777,8 +1889,6 @@ jobs:
           import os, pathlib, sys
           src,dst=(pathlib.Path(a) for a in sys.argv[1:])
           if not src.is_dir(): raise SystemExit(0)
-          # Whitelist file types. Never copy raw rrpl, INFO, key-bearing
-          # reproxy command dumps, or a multi-GiB compiler output wholesale.
           forbidden=('.rrpl','.rpl','.redacting','.compact')
           count=0
           for file in src.iterdir():
@@ -3788,14 +1898,12 @@ jobs:
               if name.startswith('reproxy_') and '.rrpl' in name: continue
               if file.suffix not in ('.txt','.tsv','.log','.xml','.patch','.pb','.json','.md'):
                   continue
-              # Risky raw action logs / unbounded CI compiler output are excluded.
               if 'reproxy_log' in name or 'reproxy.INFO' in name: continue
               size=file.stat().st_size
               limit=6*1048576 if name in ('full-rom-build.log','m-nothing.log') else 3*1048576
               if file.suffix=='.pb': limit=8*1048576
               with file.open('rb') as source, (dst/name).open('wb') as target:
                   if size > limit:
-                      # Take end to capture failure; annotate truncation clearly.
                       target.write(f'[TRUNCATED LOG: original_bytes={size}, preserved_tail_bytes={limit}]\n'.encode())
                       source.seek(-limit,os.SEEK_END)
                   while True:
@@ -3803,12 +1911,8 @@ jobs:
                       if not chunk: break
                       target.write(chunk)
               count+=1
-          (dst/'artifact-stage-summary.txt').write_text(f'files={count}\nraw_rrpl_excluded=true\nlarge_logs_tailed=true\n')
-          print(f'Diagnostic files staged: {count}')
+          (dst/'artifact-stage-summary.txt').write_text(f'files={count}\n')
           PYSTAGE
-          echo '=== UPLOAD PAYLOAD SIZE ==='
-          du -sh "$DST"
-          df -h /
 
       - name: Redact BuildBuddy API key from RBE artifacts
         id: redact_diagnostics
@@ -3816,16 +1920,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Streaming, bounded-memory redaction. No read_bytes() of multi-GiB
-          # files, no secret in the workflow stdout or command line.
           python3 - <<'PYREDACT'
           import os
           from pathlib import Path
           key=os.environ.get('BUILDBUDDY_API_KEY','').encode()
-          # Redact ONLY the bounded upload snapshot, not multi-GiB active raw RBE logs.
           root=Path('/home/runner/work/los/rbe-upload')
           if not key or not root.is_dir(): raise SystemExit('Refusing unredacted diagnostics upload: key or staging missing')
-          assert len(key)>0
           chunk=1024*1024
           for file in root.rglob('*'):
               if not file.is_file() or file.is_symlink(): continue
@@ -3846,14 +1946,12 @@ jobs:
                   if dirty:
                       os.chmod(temp,file.stat().st_mode)
                       os.replace(temp,file)
-                      print('Redacted secret from:',file.relative_to(root))
                   else: temp.unlink()
               finally:
                   if temp.exists(): temp.unlink()
           PYREDACT
 
       - name: Upload full ROM trial diagnostics
-        # Never upload if staging/redaction failed; even partial logs may contain secrets.
         if: ${{ always() && steps.stage_diagnostics.outcome == 'success' && steps.redact_diagnostics.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
@@ -3862,7 +1960,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Always run AFTER ROM and diagnostic uploads; keep mount live for upload.
       - name: Unmount compressed workspace (best effort)
         if: ${{ always() && inputs.workspace_storage == 'btrfs_zstd' }}
         shell: bash
@@ -3870,16 +1967,10 @@ jobs:
           set +e
           WORKSPACE=/home/runner/work/los
           BACKING=/tmp/los20-workspace-btrfs.img
-          echo '=== BTRFS FINAL PHYSICAL USAGE ==='
-          df -hT / "$WORKSPACE"
-          du -h "$BACKING" 2>/dev/null || true
           sync
           if mountpoint -q "$WORKSPACE"; then
             sudo umount "$WORKSPACE"
           fi
           if ! mountpoint -q "$WORKSPACE"; then
             rm -f -- "$BACKING"
-            echo 'Btrfs workspace detached; backing image removed.'
-          else
-            echo '::warning::Btrfs mount busy; leaving image to runner teardown.'
           fi
