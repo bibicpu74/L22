@@ -96,7 +96,6 @@ jobs:
       RBE_RRPL_KEEP_MIB: "32"
 
       # RBE & Ninja concurrency
-      # Keep local jobs at 2 to prevent local Java/R8/LLD OOM; RBE runs 24 remote jobs independently.
       NINJA_REMOTE_NUM_JOBS: "${{ inputs.remote_jobs || '24' }}"
       NINJA_HIGHMEM_NUM_JOBS: "1"
       LOCAL_NINJA_JOBS: "3"
@@ -113,7 +112,6 @@ jobs:
       GRAPH_MEM_GUARD_SAMPLES: "3"
 
       # Hybrid memory: Keep full 12 GiB disk swap + 8 GiB ZRAM throughout the entire ROM build!
-      # Prevents exit 143 OOM/runner-freeze during heavy late-stage R8/SystemUI/Metalava actions.
       SOONG_ZRAM_GIB: "8"
       SOONG_DISK_SWAP_GIB: "12"
       POST_GRAPH_DISK_SWAP_GIB: "12"
@@ -137,7 +135,6 @@ jobs:
           sudo rm -f /swapfile /build-swap /mnt/swapfile || true
           sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
 
-          # Mở rộng danh sách xóa triệt để các tool mặc định của GitHub Runner
           sudo rm -rf \
             /var/lib/docker \
             /var/lib/containerd \
@@ -335,7 +332,6 @@ jobs:
 
           mkdir -p .repo/local_manifests
 
-          # Tự động tìm starlte.xml (hoặc fallback sang star2lte.xml nếu repo-config vẫn giữ tên cũ)
           if [ -s "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/starlte.xml" ]; then
             MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/starlte.xml"
             MANIFEST_DST=".repo/local_manifests/starlte.xml"
@@ -495,7 +491,6 @@ jobs:
           exec > >(tee "$LOG") 2>&1
           test -s "$INC"
 
-          # Tự động tìm phiên bản Clang mới nhất trong LineageOS 22 (Android 15)
           CLANG="$(find prebuilts/clang/host/linux-x86 -maxdepth 3 -type f -path '*/clang-r*/bin/clang' | sort -V | tail -n1)"
           if [ -z "$CLANG" ] || [ ! -x "$CLANG" ]; then
             echo "::error::Could not locate host Clang binary under prebuilts/clang/host/linux-x86"
@@ -779,12 +774,10 @@ jobs:
           set -euo pipefail
           DETECTED_RELEASE=""
 
-          # 1. Ưu tiên đọc từ file định nghĩa chính thức của LineageOS (nếu có)
           if [ -s vendor/lineage/vars/aosp_target_release.mk ]; then
             DETECTED_RELEASE="$( sed -nE 's/^[[:space:]]*lineage_current_release[[:space:]]*:?=[[:space:]]*([a-zA-Z0-9_]+).*/\1/p' vendor/lineage/vars/aosp_target_release.mk | head -n1 )"
           fi
 
-          # 2. Quét trong build/release/Android.bp hoặc thư mục aconfig (chuẩn Android 15+)
           if [ -z "$DETECTED_RELEASE" ]; then
             for candidate in bp1a ap4a ap3a ap2a; do
               if [ -d "build/release/aconfig/${candidate}" ] || \
@@ -805,6 +798,41 @@ jobs:
 
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS 22 RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
+
+      - name: Guard Microdroid GKI 6.6 initrd when GKI prebuilts are absent
+        working-directory: /home/runner/work/los
+        shell: bash
+        run: |
+          set -euo pipefail
+          BP="packages/modules/Virtualization/build/microdroid/initrd/Android.bp"
+          if [ -f "$BP" ]; then
+            python3 - "$BP" <<'PYMICRODROID'
+          import pathlib, re, sys
+          bp_path = pathlib.Path(sys.argv[1])
+          text = bp_path.read_text()
+          lines = text.splitlines(keepends=True)
+          out = []; i = 0; removed = 0
+          while i < len(lines):
+              if re.match(r'^[a-zA-Z0-9_]+\s*\{\s*$', lines[i]):
+                  block = [lines[i]]
+                  depth = lines[i].count('{') - lines[i].count('}')
+                  i += 1
+                  while i < len(lines) and depth > 0:
+                      block.append(lines[i])
+                      depth += lines[i].count('{') - lines[i].count('}')
+                      i += 1
+                  block_str = ''.join(block)
+                  if ('microdroid_gki_modules-android15-6.6-' in block_str or
+                      'microdroid_gki-android15-6.6_initrd' in block_str):
+                      removed += 1
+                      continue
+                  out.extend(block)
+              else:
+                  out.append(lines[i]); i += 1
+          bp_path.write_text(''.join(out))
+          print(f"Removed {removed} unused GKI 6.6 initrd module block(s)")
+          PYMICRODROID
+          fi
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
@@ -1312,8 +1340,6 @@ jobs:
           fi
           mark_stage lunch
           TARGET_REL="${LINEAGE_RELEASE_CONFIG:-bp1a}"
-          # Thử gọi breakfast starlte trước (hàm chuẩn của LineageOS tự điền release config),
-          # nếu không được thì gọi trực tiếp lunch với TARGET_REL đã detect.
           if declare -F breakfast >/dev/null 2>&1; then
             breakfast starlte userdebug || lunch "lineage_starlte-${TARGET_REL}-userdebug"
           else
@@ -1328,7 +1354,6 @@ jobs:
           fi
           mark_stage java-selection
 
-          # Android 15 (LineageOS 22) sử dụng JDK 21 làm mặc định; fallback về JDK 17 nếu cần
           if [ -x "$PWD/prebuilts/jdk/jdk21/linux-x86/bin/java" ]; then
             BUNDLED_JDK="$PWD/prebuilts/jdk/jdk21/linux-x86"
           elif [ -x "$PWD/prebuilts/jdk/jdk17/linux-x86/bin/java" ]; then
@@ -1341,8 +1366,6 @@ jobs:
           export ANDROID_JAVA_HOME="$BUNDLED_JDK"
           export PATH="$JAVA_HOME/bin:$PATH"
 
-          # Cap per-JVM heap at 3.5 GiB so concurrent R8 / Metalava / turbine jobs
-          # never consume all 15 GiB RAM + Swap on the GitHub runner.
           export _JAVA_OPTIONS="-Xmx3584m"
           export JAVA_TOOL_OPTIONS="-Xmx3584m"
           export USE_CCACHE=0
@@ -1679,7 +1702,6 @@ jobs:
             exit "$MONITORED_RC"
           fi
 
-          # Retain the full 12 GiB swap for the entire ROM build!
           echo '=== ACTIVE SWAP RETAINED FOR FULL ROM BUILD ==='
           swapon --show=NAME,TYPE,SIZE,USED,PRIO || true
           free -h
