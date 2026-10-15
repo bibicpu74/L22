@@ -1,4 +1,4 @@
-name: LineageOS 22 - star2lte Btrfs ZSTD + RBE24
+name: LineageOS 22 - starlte Btrfs ZSTD + RBE24
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: los22-star2lte-rbe-full-rom-trial
+  group: los22-starlte-rbe-full-rom-trial
   cancel-in-progress: false
 
 jobs:
@@ -136,9 +136,8 @@ jobs:
           sudo swapoff -a || true
           sudo rm -f /swapfile /build-swap /mnt/swapfile || true
           sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
-          
+
           # Mở rộng danh sách xóa triệt để các tool mặc định của GitHub Runner
-          # Mở rộng danh sách xóa triệt để
           sudo rm -rf \
             /var/lib/docker \
             /var/lib/containerd \
@@ -164,7 +163,7 @@ jobs:
             /opt/microsoft \
             /usr/share/postgresql \
             /usr/share/mysql \
-            /usr/local/julia* || truea
+            /usr/local/julia* || true
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
           date +%s > /tmp/rbe-test/job-start-epoch.txt
@@ -336,11 +335,15 @@ jobs:
 
           mkdir -p .repo/local_manifests
 
-          MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml"
-          MANIFEST_DST=".repo/local_manifests/star2lte.xml"
-
-          if [ ! -s "$MANIFEST_SRC" ]; then
-            echo "::error::Local manifest not found or empty: $MANIFEST_SRC"
+          # Tự động tìm starlte.xml (hoặc fallback sang star2lte.xml nếu repo-config vẫn giữ tên cũ)
+          if [ -s "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/starlte.xml" ]; then
+            MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/starlte.xml"
+            MANIFEST_DST=".repo/local_manifests/starlte.xml"
+          elif [ -s "$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml" ]; then
+            MANIFEST_SRC="$GITHUB_WORKSPACE/repo-config/.repo-local-manifests/star2lte.xml"
+            MANIFEST_DST=".repo/local_manifests/star2lte.xml"
+          else
+            echo "::error::Local manifest not found in $GITHUB_WORKSPACE/repo-config/.repo-local-manifests/"
             exit 1
           fi
 
@@ -747,7 +750,7 @@ jobs:
               "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" >> "$TS"
           fi
 
-      - name: Verify star2lte product registration
+      - name: Verify starlte product registration
         working-directory: /home/runner/work/los
         shell: bash
         run: |
@@ -769,25 +772,34 @@ jobs:
 
           printf '%s\n' "$MATCHES"
 
-      - name: Detect and verify LineageOS 22 release config (AP3A / AP4A / BP1A)
+      - name: Detect and verify LineageOS 22 release config
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
-          CONFIG=build/release/release_config_map.mk
-          test -s "$CONFIG" || { echo "::error::Missing $CONFIG"; exit 1; }
-
           DETECTED_RELEASE=""
-          for candidate in bp1a ap4a ap3a; do
-            if grep -Eq "declare-release-config,[[:space:]]*${candidate}[[:space:]]*," "$CONFIG"; then
-              DETECTED_RELEASE="$candidate"
-              break
-            fi
-          done
+
+          # 1. Ưu tiên đọc từ file định nghĩa chính thức của LineageOS (nếu có)
+          if [ -s vendor/lineage/vars/aosp_target_release.mk ]; then
+            DETECTED_RELEASE="$( sed -nE 's/^[[:space:]]*lineage_current_release[[:space:]]*:?=[[:space:]]*([a-zA-Z0-9_]+).*/\1/p' vendor/lineage/vars/aosp_target_release.mk | head -n1 )"
+          fi
+
+          # 2. Quét trong build/release/Android.bp hoặc thư mục aconfig (chuẩn Android 15+)
+          if [ -z "$DETECTED_RELEASE" ]; then
+            for candidate in bp1a ap4a ap3a ap2a; do
+              if [ -d "build/release/aconfig/${candidate}" ] || \
+                 [ -f "build/release/build_config/${candidate}.scl" ] || \
+                 grep -Fq "\"${candidate}\"" build/release/Android.bp 2>/dev/null || \
+                 grep -Eq "declare-release-config,[[:space:]]*${candidate}[[:space:]]*," build/release/release_config_map.mk 2>/dev/null; then
+                DETECTED_RELEASE="$candidate"
+                break
+              fi
+            done
+          fi
 
           if [ -z "$DETECTED_RELEASE" ]; then
-            echo '::error::Could not find Android 15 release config (bp1a, ap4a, or ap3a) in release_config_map.mk.'
-            cat "$CONFIG"
+            echo '::error::Could not detect Android 15 release config (bp1a, ap4a, or ap3a) in build/release or vendor/lineage.'
+            ls -la build/release/ vendor/lineage/vars/ 2>/dev/null || true
             exit 1
           fi
 
@@ -1221,7 +1233,7 @@ jobs:
             exit 1
           fi
 
-      - name: Configure Lineage and build full star2lte ROM via BuildBuddy
+      - name: Configure Lineage and build full starlte ROM via BuildBuddy
         working-directory: /home/runner/work/los
         timeout-minutes: 360
         shell: bash
@@ -1300,7 +1312,13 @@ jobs:
           fi
           mark_stage lunch
           TARGET_REL="${LINEAGE_RELEASE_CONFIG:-bp1a}"
-          lunch "lineage_starlte-${TARGET_REL}-userdebug"
+          # Thử gọi breakfast starlte trước (hàm chuẩn của LineageOS tự điền release config),
+          # nếu không được thì gọi trực tiếp lunch với TARGET_REL đã detect.
+          if declare -F breakfast >/dev/null 2>&1; then
+            breakfast starlte userdebug || lunch "lineage_starlte-${TARGET_REL}-userdebug"
+          else
+            lunch "lineage_starlte-${TARGET_REL}-userdebug"
+          fi
           LUNCH_RC=$?
           set -e
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -1351,7 +1369,6 @@ jobs:
 
           if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
              [ "${TARGET_PRODUCT:-}" != "lineage_starlte" ] || \
-             [ "${TARGET_RELEASE:-}" != "$TARGET_REL" ] || \
              [ "${TARGET_BUILD_VARIANT:-}" != "userdebug" ]; then
             echo "::error::Invalid LineageOS 22 build configuration (Product=${TARGET_PRODUCT:-}, Release=${TARGET_RELEASE:-})."
             exit 1
@@ -1773,7 +1790,7 @@ jobs:
           fi
 
           mark_stage pre-build
-          echo "=== FULL ROM BUILD: star2lte / bacon ==="
+          echo "=== FULL ROM BUILD: starlte / bacon ==="
           echo "RBE remote-only enabled; local jobs=${LOCAL_NINJA_JOBS}, remote=${NINJA_REMOTE_NUM_JOBS}, highmem=1, no local ccache."
           enforce_initial_disk_guard pre-build
 
