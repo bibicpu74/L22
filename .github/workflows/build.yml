@@ -799,18 +799,21 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS 22 RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Provide dummy GKI filegroups to satisfy Soong Virtualization graph
+      - name: Provide dummy GKI and Trusty filegroups to satisfy Soong graph
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           
+          # 1. Khôi phục các file Android.bp bị xóa lỗi nếu đã chạy job trước đó
           git -C packages/modules/Virtualization restore . || true
           git -C packages/modules/Virtualization clean -fd || true
           
+          # 2. Tạo file dummy.bin chung
           mkdir -p build/soong/dummy_gki
           touch build/soong/dummy_gki/dummy.bin
           
+          # 3. Tạo Android.bp chứa GKI kernel prebuilts
           cat > build/soong/dummy_gki/Android.bp <<'EOF'
           package {
               default_visibility: ["//visibility:public"],
@@ -846,7 +849,14 @@ jobs:
           filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-x86_64", srcs: ["dummy.bin"] }
           EOF
           
-          echo "Successfully injected dummy GKI filegroups with public visibility."
+          # 4. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
+          mkdir -p prebuilts/build-tools/path/darwin-x86
+          for cmd in awk basename bc bzcat bzip2 cat chmod cmp comm cp cpio cut date dd dirname du echo egrep env file find getconf getopt grep gzip head hostname id install ln ls md5sum mkdir mktemp mv nl od paste patch printf pwd python3 readlink realpath rm rmdir sed seq setsid sha1sum sha256sum sha512sum sleep sort stat tail tar tee test timeout touch tr true truncate uname uniq unix2dos wc which whoami xargs xxd xz xzcat zipinfo; do
+            touch "prebuilts/build-tools/path/darwin-x86/$cmd"
+            chmod +x "prebuilts/build-tools/path/darwin-x86/$cmd"
+          done
+          
+          echo "Successfully injected dummy GKI filegroups and Darwin-x86 build-tools to satisfy Soong graph."
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
