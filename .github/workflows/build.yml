@@ -138,6 +138,7 @@ jobs:
           sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
           
           # Mở rộng danh sách xóa triệt để các tool mặc định của GitHub Runner
+          # Mở rộng danh sách xóa triệt để
           sudo rm -rf \
             /var/lib/docker \
             /var/lib/containerd \
@@ -158,7 +159,12 @@ jobs:
             /usr/share/miniconda \
             /usr/local/aws-cli \
             /usr/local/aws-sam-cli \
-            /usr/local/share/vcpkg || true
+            /usr/local/share/vcpkg \
+            /opt/google \
+            /opt/microsoft \
+            /usr/share/postgresql \
+            /usr/share/mysql \
+            /usr/local/julia* || truea
 
           mkdir -p /home/runner/work/los /tmp/rbe-test
           date +%s > /tmp/rbe-test/job-start-epoch.txt
@@ -751,12 +757,12 @@ jobs:
           MATCHES="$(
             grep -R -l \
               --include='AndroidProducts.mk' \
-              'lineage_star2lte' \
+              'lineage_starlte' \
               device vendor 2>/dev/null | head -20 || true
           )"
 
           if [ -z "$MATCHES" ]; then
-            echo "::error::Could not find lineage_star2lte in any AndroidProducts.mk."
+            echo "::error::Could not find lineage_starlte in any AndroidProducts.mk."
             find device vendor -maxdepth 4 -name AndroidProducts.mk -print 2>/dev/null | head -100 || true
             exit 1
           fi
@@ -1294,12 +1300,12 @@ jobs:
           fi
           mark_stage lunch
           TARGET_REL="${LINEAGE_RELEASE_CONFIG:-bp1a}"
-          lunch "lineage_star2lte-${TARGET_REL}-userdebug"
+          lunch "lineage_starlte-${TARGET_REL}-userdebug"
           LUNCH_RC=$?
           set -e
           trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
           if [ "$LUNCH_RC" -ne 0 ]; then
-            echo "::error::lunch lineage_star2lte-${TARGET_REL}-userdebug returned $LUNCH_RC" >&2
+            echo "::error::lunch lineage_starlte-${TARGET_REL}-userdebug returned $LUNCH_RC" >&2
             exit "$LUNCH_RC"
           fi
           mark_stage java-selection
@@ -1344,7 +1350,7 @@ jobs:
             "${GOMEMLIMIT:-disabled}" > /tmp/rbe-test/soong-go-runtime.txt
 
           if [ -z "${ANDROID_BUILD_TOP:-}" ] || \
-             [ "${TARGET_PRODUCT:-}" != "lineage_star2lte" ] || \
+             [ "${TARGET_PRODUCT:-}" != "lineage_starlte" ] || \
              [ "${TARGET_RELEASE:-}" != "$TARGET_REL" ] || \
              [ "${TARGET_BUILD_VARIANT:-}" != "userdebug" ]; then
             echo "::error::Invalid LineageOS 22 build configuration (Product=${TARGET_PRODUCT:-}, Release=${TARGET_RELEASE:-})."
