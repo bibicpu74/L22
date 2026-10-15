@@ -850,6 +850,8 @@ jobs:
           EOF
           
           # 4. Vá cấu trúc lệnh mac OS giả cho Trusty OS (darwin-x86 build-tools path)
+          # Xóa symlinks cũ đi trước khi tạo file thực
+          rm -rf prebuilts/build-tools/path/darwin-x86 || true
           mkdir -p prebuilts/build-tools/path/darwin-x86
           for cmd in awk basename bc bzcat bzip2 cat chmod cmp comm cp cpio cut date dd dirname du echo egrep env file find getconf getopt grep gzip head hostname id install ln ls md5sum mkdir mktemp mv nl od paste patch printf pwd python3 readlink realpath rm rmdir sed seq setsid sha1sum sha256sum sha512sum sleep sort stat tail tar tee test timeout touch tr true truncate uname uniq unix2dos wc which whoami xargs xxd xz xzcat zipinfo; do
             touch "prebuilts/build-tools/path/darwin-x86/$cmd"
