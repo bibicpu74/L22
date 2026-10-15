@@ -805,11 +805,9 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Khôi phục các file Android.bp đã bị python script ở phiên bản trước sửa đổi (để tránh xung đột)
           git -C packages/modules/Virtualization restore . || true
           git -C packages/modules/Virtualization clean -fd || true
           
-          # Tạo dummy filegroups để thay thế cho các kernel prebuilts đã bị xóa trong manifest
           mkdir -p build/soong/dummy_gki
           touch build/soong/dummy_gki/dummy.bin
           
@@ -835,6 +833,13 @@ jobs:
           filegroup { name: "microdroid_gki_modules-android14-6.1-x86_64", srcs: ["dummy.bin"] }
           filegroup { name: "microdroid_gki_modules-android15-6.1-arm64", srcs: ["dummy.bin"] }
           filegroup { name: "microdroid_gki_modules-android15-6.1-x86_64", srcs: ["dummy.bin"] }
+          
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.6-arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.6-x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android14-6.1-arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android14-6.1-x86_64", srcs: ["dummy.bin"] }
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-arm64", srcs: ["dummy.bin"] }
+          filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-x86_64", srcs: ["dummy.bin"] }
           EOF
           
           echo "Successfully injected dummy GKI filegroups to satisfy Virtualization module dependencies."
