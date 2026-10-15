@@ -799,41 +799,48 @@ jobs:
           echo "LINEAGE_RELEASE_CONFIG=$DETECTED_RELEASE" >> "$GITHUB_ENV"
           echo "=== LINEAGEOS 22 RELEASE CONFIG VERIFIED: $DETECTED_RELEASE ==="
 
-      - name: Guard Microdroid GKI 6.6 and Kernel Hashes
+      - name: Purge Microdroid and VM Service modules from Soong graph
         working-directory: /home/runner/work/los
         shell: bash
         run: |
           set -euo pipefail
           
-          BP2="packages/modules/Virtualization/build/microdroid/Android.bp"
-          if [ -f "$BP2" ]; then
-            python3 - "$BP2" <<'PYMOD2'
-          import pathlib, re, sys
-          bp_path = pathlib.Path(sys.argv[1])
-          text = bp_path.read_text()
-          lines = text.splitlines(keepends=True)
-          out = []; i = 0; removed = 0
-          while i < len(lines):
-              if re.match(r'^[a-zA-Z0-9_]+\s*\{\s*$', lines[i]):
-                  block = [lines[i]]
-                  depth = lines[i].count('{') - lines[i].count('}')
-                  i += 1
-                  while i < len(lines) and depth > 0:
-                      block.append(lines[i])
-                      depth += lines[i].count('{') - lines[i].count('}')
+          python3 - <<'PYPURGE'
+          import pathlib, re
+
+          targets = [
+              "packages/modules/Virtualization/build/microdroid/Android.bp",
+              "packages/modules/Virtualization/build/microdroid/initrd/Android.bp",
+              "packages/modules/Virtualization/libs/libservice_vm_fake_chain/Android.bp",
+              "packages/modules/Virtualization/libs/libservice_vm_requests/Android.bp"
+          ]
+
+          for path_str in targets:
+              bp_path = pathlib.Path(path_str)
+              if not bp_path.is_file():
+                  continue
+              text = bp_path.read_text()
+              lines = text.splitlines(keepends=True)
+              out = []; i = 0; removed = 0
+              while i < len(lines):
+                  if re.match(r'^[a-zA-Z0-9_]+\s*\{\s*$', lines[i]):
+                      block = [lines[i]]
+                      depth = lines[i].count('{') - lines[i].count('}')
                       i += 1
-                  block_str = ''.join(block)
-                  if ('microdroid_gki-android15-6.6' in block_str or
-                      'microdroid_kernel_hashes' in block_str):
-                      removed += 1
-                      continue
-                  out.extend(block)
-              else:
-                  out.append(lines[i]); i += 1
-          bp_path.write_text(''.join(out))
-          print(f"Removed {removed} unused Microdroid GKI/hash blocks from microdroid/Android.bp")
-          PYMOD2
-          fi
+                      while i < len(lines) and depth > 0:
+                          block.append(lines[i])
+                          depth += lines[i].count('{') - lines[i].count('}')
+                          i += 1
+                      block_str = ''.join(block)
+                      if any(k in block_str for k in ['microdroid_', 'libmicrodroid_', 'libservice_vm_']):
+                          removed += 1
+                          continue
+                      out.extend(block)
+                  else:
+                      out.append(lines[i]); i += 1
+              bp_path.write_text(''.join(out))
+              print(f"Purged {removed} virtualization module blocks from {bp_path}")
+          PYPURGE
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
