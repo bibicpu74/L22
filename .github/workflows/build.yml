@@ -812,6 +812,10 @@ jobs:
           touch build/soong/dummy_gki/dummy.bin
           
           cat > build/soong/dummy_gki/Android.bp <<'EOF'
+          package {
+              default_visibility: ["//visibility:public"],
+          }
+
           filegroup { name: "kernel_aarch64_6.6", srcs: ["dummy.bin"] }
           filegroup { name: "kernel_x86_64_6.6", srcs: ["dummy.bin"] }
           filegroup { name: "kernel_aarch64_6.1", srcs: ["dummy.bin"] }
@@ -842,7 +846,7 @@ jobs:
           filegroup { name: "microdroid_gki_kernel_prebuilts-android15-6.1-x86_64", srcs: ["dummy.bin"] }
           EOF
           
-          echo "Successfully injected dummy GKI filegroups to satisfy Virtualization module dependencies."
+          echo "Successfully injected dummy GKI filegroups with public visibility."
 
       - name: Validate DWARF size optimization
         working-directory: /home/runner/work/los
