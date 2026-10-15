@@ -404,11 +404,11 @@ jobs:
             echo "Removed from repo sync: $removed"
           done
           for required in \
-            device/samsung/star2lte \
+            device/samsung/starlte \
             device/samsung/exynos9810-common \
             device/samsung_slsi/sepolicy \
             kernel/samsung/exynos9810 \
-            vendor/samsung/star2lte \
+            vendor/samsung/starlte \
             vendor/samsung/exynos9810-common \
             hardware/samsung; do
             if ! grep -Fxq "$required" /tmp/rbe-test/manifest-projects-after-trim.txt; then
@@ -1801,7 +1801,7 @@ jobs:
           fi
 
           mark_stage verify-rom-zip
-          ROM_DIR="$ANDROID_BUILD_TOP/out/target/product/star2lte"
+          ROM_DIR="$ANDROID_BUILD_TOP/out/target/product/starlte"
           ls -lah "$ROM_DIR" | tail -n 45
           mapfile -d '' -t ROM_ZIPS < <(find "$ROM_DIR" -maxdepth 1 -type f -name 'lineage-*.zip' -print0)
           if (( ${#ROM_ZIPS[@]} == 0 )); then
@@ -1825,8 +1825,8 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: lineage-22-star2lte-${{ github.run_id }}
-          path: /home/runner/work/los/out/target/product/star2lte/lineage-*.zip
+          name: lineage-22-starlte-${{ github.run_id }}
+          path: /home/runner/work/los/out/target/product/starlte/lineage-*.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
