@@ -804,9 +804,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BP="packages/modules/Virtualization/build/microdroid/initrd/Android.bp"
-          if [ -f "$BP" ]; then
-            python3 - "$BP" <<'PYMICRODROID'
+          
+          # 1. Vá file initrd/Android.bp
+          BP1="packages/modules/Virtualization/build/microdroid/initrd/Android.bp"
+          if [ -f "$BP1" ]; then
+            python3 - "$BP1" <<'PYMOD1'
           import pathlib, re, sys
           bp_path = pathlib.Path(sys.argv[1])
           text = bp_path.read_text()
@@ -823,15 +825,45 @@ jobs:
                       i += 1
                   block_str = ''.join(block)
                   if ('microdroid_gki_modules-android15-6.6-' in block_str or
-                      'microdroid_gki-android15-6.6_initrd' in block_str):
+                      'microdroid_gki-android15-6.6' in block_str):
                       removed += 1
                       continue
                   out.extend(block)
               else:
                   out.append(lines[i]); i += 1
           bp_path.write_text(''.join(out))
-          print(f"Removed {removed} unused GKI 6.6 initrd module block(s)")
-          PYMICRODROID
+          print(f"Removed {removed} unused GKI 6.6 blocks from initrd/Android.bp")
+          PYMOD1
+          fi
+
+          # 2. Vá file microdroid/Android.bp chính
+          BP2="packages/modules/Virtualization/build/microdroid/Android.bp"
+          if [ -f "$BP2" ]; then
+            python3 - "$BP2" <<'PYMOD2'
+          import pathlib, re, sys
+          bp_path = pathlib.Path(sys.argv[1])
+          text = bp_path.read_text()
+          lines = text.splitlines(keepends=True)
+          out = []; i = 0; removed = 0
+          while i < len(lines):
+              if re.match(r'^[a-zA-Z0-9_]+\s*\{\s*$', lines[i]):
+                  block = [lines[i]]
+                  depth = lines[i].count('{') - lines[i].count('}')
+                  i += 1
+                  while i < len(lines) and depth > 0:
+                      block.append(lines[i])
+                      depth += lines[i].count('{') - lines[i].count('}')
+                      i += 1
+                  block_str = ''.join(block)
+                  if 'microdroid_gki-android15-6.6' in block_str:
+                      removed += 1
+                      continue
+                  out.extend(block)
+              else:
+                  out.append(lines[i]); i += 1
+          bp_path.write_text(''.join(out))
+          print(f"Removed {removed} unused GKI 6.6 blocks from microdroid/Android.bp")
+          PYMOD2
           fi
 
       - name: Validate DWARF size optimization
