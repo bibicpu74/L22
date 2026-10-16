@@ -70,7 +70,7 @@ jobs:
       # Android / Soong RBE
       USE_RBE: "1"
       RBE_DIR: "prebuilts/remoteexecution-client/live"
-      RBE_CXX_EXEC_STRATEGY: "remote"
+      RBE_CXX_EXEC_STRATEGY: "remote_local_fallback"
 
       # Loopback plaintext h2c -> nginx gRPC TLS proxy with BuildBuddy API key
       RBE_service: "127.0.0.1:19099"
