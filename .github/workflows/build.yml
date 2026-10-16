@@ -1832,8 +1832,8 @@ jobs:
             echo "::error::Primary Soong Ninja graph missing: $SOONG_NINJA"
             exit 73
           fi
-          if [ "${RBE_CXX_EXEC_STRATEGY:-}" != remote ]; then
-            echo '::error::Remote-only C/C++ strategy is required for this trial.'
+          if [[ "${RBE_CXX_EXEC_STRATEGY:-}" != "remote" && "${RBE_CXX_EXEC_STRATEGY:-}" != "remote_local_fallback" ]]; then
+            echo '::error::Remote or fallback C/C++ strategy is required for this trial.'
             exit 73
           fi
 
